@@ -47,27 +47,23 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 
 ### Normal Local User ###
 
-```
+```bash
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
-
-``
+```
 
 
 ### Python virtualenv ###
 
-```
-
+```bash
 python3 -m venv venv
 source venv/bin/activate
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
-
-
 ```
 
 
 ### Docker ###
 
-```
+```bash
 git clone https://github.com/AndySchroder/StaticWire.git
 cd StaticWire
 docker-compose up --build
@@ -75,12 +71,13 @@ docker-compose up --build
 
 This command is blocking, so, when the build completes, open a new terminal window and run
 
-`docker exec -it StaticWireClient bash`
+```bash
+docker exec -it StaticWireClient bash
+```
 
 to get a shell inside the docker container.
 
 
-```
 
 
 
@@ -88,7 +85,9 @@ to get a shell inside the docker container.
 
 After following one of the above installation approaches, you can use the `staticIP` command.
 
-`usage: staticIP [-h] [-a] {RentNewIP,GetRentalStatus,GetConf,Renew}`
+```
+usage: staticIP [-h] [-a] {RentNewIP,GetRentalStatus,GetConf,Renew}
+```
 
 
 - `RentNewIP` will rent a new IP address. First it will present an invoice. After payment the tunnel configuration info will be provided.

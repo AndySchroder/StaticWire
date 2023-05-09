@@ -1,0 +1,17 @@
+version: '3.3'
+
+services:
+  StaticWireClient:
+    restart: unless-stopped
+    image: staticwire
+    build: .
+    container_name: StaticWireClient
+    command:
+      - sleep
+      - infinity
+
+
+
+
+
+

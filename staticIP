@@ -9,20 +9,12 @@
 ###############################################################################
 
 
-print('')
-print('')
-print('')
-print('')
-
 
 ################################################################
 # import modules
 ################################################################
 
-
-
-
-
+from math import ceil
 from pathlib import Path
 from os import makedirs,getcwd
 from os.path import isfile,isdir
@@ -34,7 +26,8 @@ import requests
 from requests_toolbelt.adapters.fingerprint import FingerprintAdapter
 from qrcode_term import qrcode_string
 from wireguard_tools import WireguardConfig,WireguardKey
-from helpers2 import TimeStampedPrint,SetPrintWarningMessages;SetPrintWarningMessages(True)
+from datetime import datetime,timedelta
+from helpers2 import RoundAndPadToString,TimeStampedPrint,SetPrintWarningMessages,FullDateTimeString;SetPrintWarningMessages(True)
 
 # use ruamel.yaml to try and get more desireable indentation of the output
 # ruamel.yaml claims it is so much better than PyYAML, but it is not really that much better.
@@ -45,6 +38,33 @@ yaml.default_flow_style = False
 yaml.indent(mapping=8, sequence=2, offset=0)
 
 
+
+
+
+
+
+
+
+################################################################
+# parse the command line
+################################################################
+
+parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP addresses using bitcoin lightning payments")
+parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay invoices (not yet implemented).")
+parser.add_argument('--amount', default=24000,type=int,help="amount of credit to add (default: %(default)s) [sat].")
+arguments=parser.parse_args()
+
+
+
+
+################################################################
+# give some extra space in the output terminal
+################################################################
+
+print('')
+print('')
+print('')
+print('')
 
 
 
@@ -115,6 +135,7 @@ if ConfigFile.get('private_key') is None:
 	ChangesToConfigFile+=1
 	TimeStampedPrint('no private_key found in '+TheDataFolder+ConfigFileName+', so created one and overwrote any public_key that may have existed with a new one!')
 
+TimeStampedPrint('local wireguard public_key: '+ConfigFile['public_key'])
 
 if ChangesToConfigFile>0:
 	TimeStampedPrint('writing to '+TheDataFolder+ConfigFileName)
@@ -126,12 +147,18 @@ else:
 
 
 
+
+
+################################################################
+# configure https request object
+################################################################
+
 # setup a secure session that trusts only a certain fingerprint (see https://toolbelt.readthedocs.io/en/latest/adapters.html#fingerprintadapter)
 # we don't want to deal with certificate authorities, they are a nuisance and they can't be trusted anyway.
 # requiring a trusted fingerprint allows verify=False to be used on each request. note, https://medium.com/@jbirdvegas/python-certificate-pinning-c44e9a34ed1c suggests that
 # requests_toolbelt ignores the fingerprint verification of standard validation is turned off, but tested it and this seems to not be true.
 SecureSession = requests.Session()
-SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFile['Server']['TrustedFingerprint']))
+SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFile['Server']['TrustedFingerprint']))		#ConfigFile['Server']['HostName'] is needed here (in addition to in the .post() function) to provide a scope for the FingerprintAdapter.
 
 
 
@@ -142,23 +169,82 @@ SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFi
 
 
 
+################################################################
+# define functions
+################################################################
 
 
+def AddCredit(amount):
 
+	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/AddCredit/', data={'WireGuardPubKey': ConfigFile['public_key'], 'amount': amount},verify=False)
 
+	if response.status_code != 200:
 
-def ProcessInvoice(response):
+		print(response.status_code)
+		print(response.content)
+
+		raise Exception('rental server API query gave a bad status_code.')
+
 	if 'Error' not in response.json():
 
-#		TimeStampedPrint(response.json(),prettyprintprepend='config',prettyprint=True)
+		AddedTime=response.json()['AddedCredit']/response.json()['CurrentRate']
+
+		if response.json()['InitialInvoice'] != True:
+
+			Status=RentalStatus()
+
+			NewRemainingTime=Status['TimeRemaining']+AddedTime
+
+			PrintRentalStatus(Status)
+
+			print()
+			print('---------------------------------------------------------------------------------------------------')
+			print()
+			TimeStampedPrint('adding credit for static IP address '+Status['Address'])
+			print()
+
+		else:
+			print()
+			print('---------------------------------------------------------------------------------------------------')
+			print()
+			TimeStampedPrint('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel and static IP address with an initial credit amount of '+str(amount)+' [sat]')
+			print()
+
+			NewRemainingTime=AddedTime
+
+
+
+
 		DecodedInvoice = decode(response.json()['Invoice'])
 
 		print()
 		TimeStampedPrint(response.json(),prettyprintprepend='Terms',prettyprint=True)
 		print()
+		print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
+		print()
+
+		print('new rental rate :                  '+RoundAndPadToString(1/response.json()['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(response.json()['CurrentRate']*(3600*24),0)+' [sat/day], '+RoundAndPadToString(response.json()['CurrentRate']*(3600*24*(365.25/12)),0)+' [sat/month]')
+
+		print('invoice expires :                  '+FullDateTimeString(DecodedInvoice.timestamp+DecodedInvoice.expiry_time)+' (in '+str(timedelta(seconds=ceil(DecodedInvoice.timestamp+DecodedInvoice.expiry_time-time())))+')')
+		print('total invoice amount :             '+RoundAndPadToString(DecodedInvoice.amount/1000,0)+' [sat]')
+
+		if response.json()['InitialInvoice'] == True:
+			print('one time address activation fee:   '+RoundAndPadToString(response.json()['ActivationFee'],0)+' [sat]')
+
+			if response.json()['ActivationFee']+response.json()['AddedCredit'] != DecodedInvoice.amount/1000:
+				raise Exception('itemized amounts from server do not add up to the total invoice amount.')
+
+
+		print('rental credit to be added :        '+RoundAndPadToString(response.json()['AddedCredit'],0)+' [sat] ('+str(timedelta(seconds=ceil(AddedTime)))+')')
+
+		print('new credit provides service until: '+FullDateTimeString(time()+NewRemainingTime)+' ('+str(timedelta(seconds=ceil(NewRemainingTime)))+')')
+
+
+		print()
+		print('---------------------------------------------------------------------------------------------------')
+		print()
 		print('lightning invoice: ')
-		print('amount:  '+str(DecodedInvoice.amount/1000)+' sats')
-		print('expires: '+str(DecodedInvoice.expiry_time)+' seconds')
+		print()
 		print(qrcode_string(response.json()['Invoice']))
 		print()
 
@@ -168,7 +254,10 @@ def ProcessInvoice(response):
 			if 'unpaid_invoice' in Status:
 				if Status['unpaid_invoice'] == None:
 					TimeStampedPrint('invoice paid')
-					GetRentalStatus()			# makes an extra http call, but that's fine for now
+					print()
+					print('---------------------------------------------------------------------------------------------------')
+					print()
+					PrintRentalStatus(Status)
 					if response.json()['InitialInvoice'] == True:
 						GetConf()
 					break
@@ -183,29 +272,63 @@ def ProcessInvoice(response):
 
 
 
-def RentNewIP():
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/rent/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
-	ProcessInvoice(response)
-
-def RenewIP():
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/renew/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
-	ProcessInvoice(response)
 
 def RentalStatus():
 	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getstatus/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
+
+	if response.status_code != 200:
+
+		print(response.status_code)
+		print(response.content)
+
+		raise Exception('rental server API query gave a bad status_code.')
+
 	return response.json()
 
-def GetRentalStatus():
+def PrintRentalStatus(Status):
+
 	print()
-	TimeStampedPrint(RentalStatus(),prettyprintprepend='IPRentStatus',prettyprint=True)
+	TimeStampedPrint(Status,prettyprintprepend='IP Rental Status',prettyprint=True)
 	print()
+
+	if 'Error' not in Status:
+
+		print()
+		print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
+		print()
+
+		print('rental rate :                      '+RoundAndPadToString(1/Status['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(Status['CurrentRate']*(3600*24),0)+' [sat/day], '+RoundAndPadToString(Status['CurrentRate']*(3600*24*(365.25/12)),0)+' [sat/month]')
+		print('start time :                       '+FullDateTimeString(Status['start_time'])+' ('+str(timedelta(seconds=ceil(time()-Status['start_time'])))+' ago)')
+		print('paid until :                       '+FullDateTimeString(time()+Status['TimeRemaining'])+' ('+str(timedelta(seconds=ceil(Status['TimeRemaining'])))+')')		# trusing the server for this and not doing the calculation locally (although have all the data to do it), should verify this.......
+		print('total paid :                       '+RoundAndPadToString(Status['total_paid'],0)+' [sat]')
+		print('credit :                           '+RoundAndPadToString(Status['Credit'],0)+' [sat]')
+
+
+
+
+
+
+
 
 def GetConf():
 	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getconf/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
+
+	if response.status_code != 200:
+
+		print(response.status_code)
+		print(response.content)
+
+		raise Exception('rental server API query gave a bad status_code.')
+
+	print()
+	print('---------------------------------------------------------------------------------------------------')
 	print()
 	TimeStampedPrint(response.json(),prettyprintprepend='tunnel config info',prettyprint=True)
 
 	if 'Error' not in response.json():
+
+		print()
+		print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
 		print()
 		GenerateConfig(response.json())
 		print()
@@ -300,35 +423,20 @@ def GenerateConfig(dict_config):
 
 
 
-parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with public IP addresses using bitcoin lightning payments")
-parser.add_argument("Action", help="indicate the action to take.",choices=['RentNewIP', 'GetRentalStatus','GetConf','Renew'])
-parser.add_argument("-a","--autopay", help="use stored LND credentials to automatically pay invoices", action="store_true")
-arguments=parser.parse_args()
+################################################################
+# act based on the command line arguments
+################################################################
 
-
-if arguments.autopay:
-	# not implemented yet
-	pass
-
-
-Action=arguments.Action
-
-print()
-print()
-TimeStampedPrint('local wireguard public_key: '+ConfigFile['public_key'])
-
-if   Action == 'RentNewIP':
-	RentNewIP()
-elif Action == 'GetRentalStatus':
-	GetRentalStatus()
-elif Action == 'GetConf':
+if   arguments.Action == 'AddCredit':
+	AddCredit(amount=arguments.amount)
+elif arguments.Action == 'GetRentalStatus':
+	PrintRentalStatus(RentalStatus())
+elif arguments.Action == 'GetConf':
 	GetConf()
-elif Action == 'Renew':
-	RenewIP()
+elif arguments.Action == 'AutoPay':
+	print('AutoPay not yet implemented')
 else:	#should never get here because "choices" defined above should error out first.
 	raise Exception('invalid action')
-
-
 
 print()
 print()

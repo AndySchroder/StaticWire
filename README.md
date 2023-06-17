@@ -32,13 +32,16 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 
 ### Current Terms of Sale (subject to change) ###
 
-- Each month's rent is 24,000 sat.
-- First payment required is 72,000 sat (48,000 sat activation fee for the tunnel and IP address + 24,000 sat (the first month's rent)).
-- If a renewal is missed, the address will be reserved for up to 2 months, but back payments are required to re-activate it.
+- The first payment includes 
+    - a non-refundable activation fee of 48,000 sat that reserves the tunnel & the dedicated public static IPv4 address and
+    - at least 1,000 sat for the initial rental credit (this may be increased in the future to prevent IP address squatting if there is too much abuse of the server).
+- The total minimum first payment therefor is 49,000 sat.
+- After the first payment the smallest allowable rental credit payment size is 500 sat. The default payment size is 24,000 sat (1 month's rent). Server max credit will be 72,000 sat (3 month's rent) for now but the plan is to increase to 288,000 sat (12 month's rent) in the medium term and 576,000 sat (24 month's rent) in the long term.
+- If no payments are made and the rental credit becomes 0, the tunnel will be turned off but the address will be reserved for up to 2 months. In order to re-activate the tunnel, back rental payments are required.
 - This service is experimental, and being shared for trial use. It comes with no warranty or liabilities of any kind.
 - This service provides a raw internet connection with no firewall built in. It is the user's responsibility to apply appropriate firewalling. Not liable for damages of any kind do to lack of expertise in how tunnels and routers works.
 - Tunnels are subject to termination due to software defects or policy changes.
-- Terms are Subject to change.
+- Terms are subject to change.
 
 
 
@@ -48,6 +51,7 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 ### Normal Local User ###
 
 ```bash
+apt install -y python3-pip git
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
 ```
 
@@ -55,6 +59,7 @@ pip3 install git+https://github.com/AndySchroder/StaticWire.git
 ### Python virtualenv ###
 
 ```bash
+apt install -y python3-pip git
 python3 -m venv venv
 source venv/bin/activate
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
@@ -83,19 +88,17 @@ to get a shell inside the docker container.
 
 ## Usage ##
 
-After following one of the above installation approaches, you can use the `staticIP` command.
+After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides a dedicated public static IP address.
 
 ```
-usage: staticIP [-h] [-a] {RentNewIP,GetRentalStatus,GetConf,Renew}
+usage: staticIP [-h] [--amount AMOUNT] {AddCredit,GetRentalStatus,GetConf,AutoPay}
 ```
 
-
-- `RentNewIP` will rent a new IP address. First it will present an invoice. After payment the tunnel configuration info will be provided.
-- `GetRentalStatus` will give the current status of the tunnel so you can determine when you need to renew.
-- `GetConf` will give the tunnel's configuration if you lost it after running `RentNewIP`.
-- `Renew` will give you a new lightning invoice to renew an existing rental.
-- The `-a` option is not yet implemented.
-
+- `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made.
+- `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments.
+- `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`.
+- `AutoPay` runs continuously and uses stored LND credentials to automatically pay invoices (not yet implemented).
+- `--amount AMOUNT` allows the amount of credit that you want to add to be specified (the default is 24,000) [sat].
 
   
   

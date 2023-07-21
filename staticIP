@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 
 
 ###############################################################################
@@ -15,19 +15,24 @@
 ################################################################
 
 from math import ceil
+from copy import copy
 from pathlib import Path
-from os import makedirs,getcwd
+import sys,socket,subprocess
+from os import makedirs,getcwd,symlink,geteuid
 from os.path import isfile,isdir
 from argparse import ArgumentParser
 from ruamel.yaml import YAML
 from time import time,sleep
+from lndgrpc import LNDClient
 from bolt11.core import decode
 import requests
 from requests_toolbelt.adapters.fingerprint import FingerprintAdapter
 from qrcode_term import qrcode_string
 from wireguard_tools import WireguardConfig,WireguardKey
 from datetime import datetime,timedelta
-from helpers2 import RoundAndPadToString,TimeStampedPrint,SetPrintWarningMessages,FullDateTimeString;SetPrintWarningMessages(True)
+from helpers2 import RoundAndPadToString,IndentedPrettyPrint,SetPrintWarningMessages,FullDateTimeString;SetPrintWarningMessages(True)
+from threading import Thread,Event
+from pystemd.systemd1 import Unit
 
 # use ruamel.yaml to try and get more desireable indentation of the output
 # ruamel.yaml claims it is so much better than PyYAML, but it is not really that much better.
@@ -42,6 +47,60 @@ yaml.indent(mapping=8, sequence=2, offset=0)
 
 
 
+################################################################
+# Only Allow One Instance to run at a time
+################################################################
+
+def OnlyAllowOneInstance(process_name):			# adapted from https://stackoverflow.com/questions/788411/check-to-see-if-python-script-is-running/7758075#7758075
+	# Without holding a reference to our socket somewhere it gets garbage
+	# collected when the function exits
+	OnlyAllowOneInstance._lock_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+	try:
+			# The null byte (\0) means the socket is created 
+			# in the abstract namespace instead of being created 
+			# on the file system itself.
+			OnlyAllowOneInstance._lock_socket.bind('\0' + process_name)
+	except socket.error:
+			print('staticIP already running, not starting')
+			sys.exit()
+
+
+OnlyAllowOneInstance('staticIP')
+
+
+
+
+
+################################################################
+# cleanly catch shutdown signals
+################################################################
+
+from signal import signal, SIGABRT, SIGILL, SIGINT, SIGSEGV, SIGTERM
+
+# catch kill signals so can cleanly shut down. this is critical to properly restore state of digital outputs to turn everything off, write files back to disk, properly release network sockets, etc..
+def clean(*args):
+	sys.exit(0)
+
+def CatchKill():
+	# warning, does not catch SIGKILL.
+	for sig in (SIGABRT, SIGILL, SIGINT, SIGSEGV, SIGTERM):
+		signal(sig, clean)
+
+CatchKill()
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -50,9 +109,13 @@ yaml.indent(mapping=8, sequence=2, offset=0)
 ################################################################
 
 parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP addresses using bitcoin lightning payments")
-parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay invoices (not yet implemented).")
-parser.add_argument('--amount', default=24000,type=int,help="amount of credit to add (default: %(default)s) [sat].")
+parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.")
+parser.add_argument('--amount', default=24000,type=int,help="allows the amount of credit that you want to add to be specified when using `AddCredit` (default: %(default)s) [sat].")
 arguments=parser.parse_args()
+
+
+
+
 
 
 
@@ -68,6 +131,172 @@ print('')
 
 
 
+
+################################################################
+# make the data directory if it doesn't exist.
+################################################################
+
+
+TheDataFolder=str(Path.home())+'/.StaticWire/'
+
+if not isdir(TheDataFolder):
+	makedirs(TheDataFolder)
+	MadeNewDataFolder=True
+else:
+	MadeNewDataFolder=False
+
+
+
+
+################################################################
+# setup logging
+################################################################
+
+import sys,logging
+from datetime import datetime
+
+class PreciseTimeFormatterWithColorizedLevel(logging.Formatter):
+
+	COLOR_CODES = {
+		logging.CRITICAL: "\033[1;35m", # bright/bold magenta
+		logging.ERROR:    "\033[1;31m", # bright/bold red
+		logging.WARNING:  "\033[1;33m", # bright/bold yellow
+		logging.INFO:     "\033[0;37m", # white / light gray
+		logging.DEBUG:    "\033[1;30m"  # bright/bold black / dark gray
+	}
+
+	RESET_CODE = "\033[0m"
+
+	converter=datetime.fromtimestamp			# need to use datetime because time.strftime doesn't do microseconds, which is what is used in https://github.com/python/cpython/blob/3.11/Lib/logging/__init__.py
+	def formatTime(self, record, datefmt):
+		if datefmt is None:                     # logging.Formatter (?) seems to set it as None if not defined, so can't just define the default in the definition of formatTime
+			datefmt='%Y.%m.%d--%H.%M.%S.%f'
+			ct = self.converter(record.created)
+		return ct.strftime(datefmt)
+
+	def __init__(self, color, *args, **kwargs):
+		super(PreciseTimeFormatterWithColorizedLevel, self).__init__(*args, **kwargs)
+		self.color = color
+
+	def format(self, record, *args, **kwargs):
+		if (self.color == True):
+
+			record.TIMEDATECOLOR = "\033[1;37;40m"		# simple example https://www.kaggle.com/discussions/general/273188
+			record.FUNCTIONNAMECOLOR = "\033[1;37;44m"
+
+			if (record.levelno in self.COLOR_CODES):
+				record.color_on  = self.COLOR_CODES[record.levelno]
+				record.color_off = self.RESET_CODE
+		else:
+			record.color_on  = ""
+			record.color_off = ""
+			record.TIMEDATECOLOR = ""
+			record.FUNCTIONNAMECOLOR = ""
+
+		return super(PreciseTimeFormatterWithColorizedLevel, self).format(record, *args, **kwargs)
+
+
+
+
+console_log_level="info"
+logfile_log_level="debug"
+
+FormatStringTemplate='%(TIMEDATECOLOR)s%(asctime)s%(color_off)s [%(color_on)s%(levelname)8s%(color_off)s, %(FUNCTIONNAMECOLOR)s%(funcName)8.8s%(color_off)s]:   %(message)s'
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(console_log_level.upper())
+ColorizeConsole=sys.stdout.isatty()				# if directed to a tty colorize, otherwise don't (so won't get escape sequences in systemd logs for example)
+console.setFormatter(PreciseTimeFormatterWithColorizedLevel(fmt=FormatStringTemplate, color=ColorizeConsole))
+
+
+logfile = logging.FileHandler(TheDataFolder+"debug.log")
+logfile.setLevel(logfile_log_level.upper()) # only accepts uppercase level names
+logfile.setFormatter(PreciseTimeFormatterWithColorizedLevel(fmt=FormatStringTemplate, color=False))
+
+logger.addHandler(console)
+logger.addHandler(logfile)
+
+
+
+
+
+
+
+logger.info('--------------------- startup ! ---------------------')
+if MadeNewDataFolder:
+	# couldn't write this until there was a place to write it to, so had to remember and then write when it was possible.
+	logger.debug(TheDataFolder+' did not exist, so created it!')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################################################
+# define constants
+################################################################
+
+NumberChecksBetweenExpectedPayments=11
+OneDay=3600*24
+
+
+
+
+
+
+
+
 ################################################################
 # assign defaults
 ################################################################
@@ -76,6 +305,7 @@ DefaultHostName='https://38.45.103.1'
 DefaultTrustedFingerprint='873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
 
 ConfigFileName='Config.yaml'
+TunnelStateFileName='TunnelState.yaml'
 
 
 
@@ -84,13 +314,8 @@ ConfigFileName='Config.yaml'
 ################################################################
 
 
-ChangesToConfigFile=0
+ChangesToConfigFile=False
 
-TheDataFolder=str(Path.home())+'/.StaticWire/'
-
-if not isdir(TheDataFolder):
-	makedirs(TheDataFolder)
-	TimeStampedPrint(TheDataFolder+' does not exist, so creating it!')
 
 if isfile(TheDataFolder+ConfigFileName):
 	with open(TheDataFolder+ConfigFileName, 'r') as file:
@@ -98,10 +323,10 @@ if isfile(TheDataFolder+ConfigFileName):
 
 	if ConfigFile is None:
 		ConfigFile={}
-		TimeStampedPrint(TheDataFolder+ConfigFileName+' is empty!')
+		logger.debug(TheDataFolder+ConfigFileName+' is empty!')
 else:
 	ConfigFile={}
-	TimeStampedPrint(TheDataFolder+ConfigFileName+' does not exist, so creating it!')
+	logger.debug(TheDataFolder+ConfigFileName+' does not exist, so creating it!')
 
 
 
@@ -114,8 +339,8 @@ if ConfigFile.get('Server') is None or ConfigFile['Server'].get('HostName') is N
 						'TrustedFingerprint' :	DefaultTrustedFingerprint,
 					}
 
-		ChangesToConfigFile+=1
-		TimeStampedPrint('HostName and TrustedFingerprint not defined, assigning default values of '+DefaultHostName+' and '+DefaultTrustedFingerprint)
+		ChangesToConfigFile=True
+		logger.info('HostName and TrustedFingerprint not defined, assigning default values of '+DefaultHostName+' and '+DefaultTrustedFingerprint)
 
 elif ConfigFile['Server'].get('TrustedFingerprint') is None:
 	raise Exception('HostName defined but TrustedFingerprint not defined in '+TheDataFolder+ConfigFileName)
@@ -132,18 +357,18 @@ if ConfigFile.get('private_key') is None:
 	ConfigFile['private_key'] = str(private_key)
 	ConfigFile['public_key'] = str(private_key.public_key())
 
-	ChangesToConfigFile+=1
-	TimeStampedPrint('no private_key found in '+TheDataFolder+ConfigFileName+', so created one and overwrote any public_key that may have existed with a new one!')
+	ChangesToConfigFile=True
+	logger.info('no private_key found in '+TheDataFolder+ConfigFileName+', so created one and overwrote any public_key that may have existed with a new one!')
 
-TimeStampedPrint('local wireguard public_key: '+ConfigFile['public_key'])
+logger.info('local wireguard public_key: '+ConfigFile['public_key'])
 
-if ChangesToConfigFile>0:
-	TimeStampedPrint('writing to '+TheDataFolder+ConfigFileName)
+if ChangesToConfigFile:
+	logger.debug('writing to '+TheDataFolder+ConfigFileName)
 	with open(TheDataFolder+ConfigFileName, 'w') as file:
 		yaml.dump(ConfigFile, file)
-	TimeStampedPrint('finished writing to '+TheDataFolder+ConfigFileName)
+	logger.debug('finished writing to '+TheDataFolder+ConfigFileName)
 else:
-	TimeStampedPrint('no changes to '+TheDataFolder+ConfigFileName)
+	logger.debug('no changes to '+TheDataFolder+ConfigFileName)
 
 
 
@@ -173,6 +398,7 @@ SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFi
 # define functions
 ################################################################
 
+# TODO: make non-autopay functions do local verification of data and compare it to the server like autopay version does.
 
 def AddCredit(amount):
 
@@ -187,11 +413,11 @@ def AddCredit(amount):
 
 	if 'Error' not in response.json():
 
-		AddedTime=response.json()['AddedCredit']/response.json()['CurrentRate']
+		AddedTime=response.json()['AddedCredit']/response.json()['SellOfferTerms']['Rate']
 
 		if response.json()['InitialInvoice'] != True:
 
-			Status=RentalStatus()
+			Status=response.json()['Status']		# Status is always bundled in with an invoice request so don't need to make a separate call for that too.
 
 			NewRemainingTime=Status['TimeRemaining']+AddedTime
 
@@ -200,14 +426,14 @@ def AddCredit(amount):
 			print()
 			print('---------------------------------------------------------------------------------------------------')
 			print()
-			TimeStampedPrint('adding credit for static IP address '+Status['Address'])
+			logger.info('adding credit for static IP address '+Status['Address'])
 			print()
 
 		else:
 			print()
 			print('---------------------------------------------------------------------------------------------------')
 			print()
-			TimeStampedPrint('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel and static IP address with an initial credit amount of '+str(amount)+' [sat]')
+			logger.info('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel and static IP address with an initial credit amount of '+RoundAndPadToString(amount,0)+' [sat]')
 			print()
 
 			NewRemainingTime=AddedTime
@@ -218,21 +444,21 @@ def AddCredit(amount):
 		DecodedInvoice = decode(response.json()['Invoice'])
 
 		print()
-		TimeStampedPrint(response.json(),prettyprintprepend='Terms',prettyprint=True)
+		logger.info(IndentedPrettyPrint(response.json(),prettyprintprepend='Terms'))
 		print()
 		print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
 		print()
 
-		print('new rental rate :                  '+RoundAndPadToString(1/response.json()['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(response.json()['CurrentRate']*(3600*24),0)+' [sat/day], '+RoundAndPadToString(response.json()['CurrentRate']*(3600*24*(365.25/12)),0)+' [sat/month]')
+		print('new rental rate :                  '+RoundAndPadToString(1/response.json()['SellOfferTerms']['Rate'],0)+' [seconds/sat] , '+RoundAndPadToString(response.json()['SellOfferTerms']['Rate']*(OneDay),0)+' [sat/day], '+RoundAndPadToString(response.json()['SellOfferTerms']['Rate']*(OneDay*(365.25/12)),0)+' [sat/month]')
 
 		print('invoice expires :                  '+FullDateTimeString(DecodedInvoice.timestamp+DecodedInvoice.expiry_time)+' (in '+str(timedelta(seconds=ceil(DecodedInvoice.timestamp+DecodedInvoice.expiry_time-time())))+')')
 		print('total invoice amount :             '+RoundAndPadToString(DecodedInvoice.amount/1000,0)+' [sat]')
 
 		if response.json()['InitialInvoice'] == True:
-			print('one time address activation fee:   '+RoundAndPadToString(response.json()['ActivationFee'],0)+' [sat]')
+			print('one time address activation fee:   '+RoundAndPadToString(response.json()['SellOfferTerms']['ActivationFee'],0)+' [sat]')
 
-			if response.json()['ActivationFee']+response.json()['AddedCredit'] != DecodedInvoice.amount/1000:
-				raise Exception('itemized amounts from server do not add up to the total invoice amount.')
+			if response.json()['SellOfferTerms']['ActivationFee']+response.json()['AddedCredit'] != DecodedInvoice.amount/1000:
+				raise Exception('itemized amounts from rental server do not add up to the total invoice amount.')
 
 
 		print('rental credit to be added :        '+RoundAndPadToString(response.json()['AddedCredit'],0)+' [sat] ('+str(timedelta(seconds=ceil(AddedTime)))+')')
@@ -248,12 +474,12 @@ def AddCredit(amount):
 		print(qrcode_string(response.json()['Invoice']))
 		print()
 
-		TimeStampedPrint('waiting for invoice to be paid')
+		logger.debug('waiting for invoice to be paid')
 		while time()<(DecodedInvoice.timestamp+DecodedInvoice.expiry_time):
 			Status=RentalStatus()
 			if 'unpaid_invoice' in Status:
 				if Status['unpaid_invoice'] == None:
-					TimeStampedPrint('invoice paid')
+					logger.info('invoice paid')
 					print()
 					print('---------------------------------------------------------------------------------------------------')
 					print()
@@ -262,46 +488,112 @@ def AddCredit(amount):
 						GetConf()
 					break
 			else:
-				TimeStampedPrint('unexpected response, trying again')
+				logger.debug('unexpected response, trying again')
 			sleep(1.25)
 		else:
-			TimeStampedPrint('invoice not paid before expiration.... need to request a new rental')
+			logger.info('invoice not paid before expiration.... need to request a new rental')
 	else:
-		TimeStampedPrint(response.json(),prettyprintprepend='config',prettyprint=True)
+		logger.error(IndentedPrettyPrint(response.json(),prettyprintprepend='config'))
 
 
 
 
 
-def RentalStatus():
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getstatus/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
+def RentalStatus(InvoiceToWaitFor=None):
+	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getstatus/', data={'WireGuardPubKey': ConfigFile['public_key'], 'InvoiceToWaitFor': InvoiceToWaitFor},verify=False)
 
-	if response.status_code != 200:
+	if (response.status_code != 200) or ('Error' in response.json()):
 
+		print()
 		print(response.status_code)
-		print(response.content)
+		print()
+		print(response.content)			# should this be changed to prettyprint ?
+		print()
 
-		raise Exception('rental server API query gave a bad status_code.')
+		raise Exception('rental server API query gave a bad status_code or Error in the response')
 
 	return response.json()
 
 def PrintRentalStatus(Status):
 
 	print()
-	TimeStampedPrint(Status,prettyprintprepend='IP Rental Status',prettyprint=True)
+	logger.info(IndentedPrettyPrint(Status,prettyprintprepend='IP Rental Status'))
 	print()
 
-	if 'Error' not in Status:
+	print()
+	print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
+	print()
 
-		print()
-		print('+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++')
-		print()
+	print('rental rate :                      '+RoundAndPadToString(1/Status['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(Status['CurrentRate']*(OneDay),0)+' [sat/day], '+RoundAndPadToString(Status['CurrentRate']*(OneDay*(365.25/12)),0)+' [sat/month]')
+	print('start time :                       '+FullDateTimeString(Status['start_time'])+' ('+str(timedelta(seconds=ceil(time()-Status['start_time'])))+' ago)')
+	print('paid until :                       '+FullDateTimeString(time()+Status['TimeRemaining'])+' ('+str(timedelta(seconds=ceil(Status['TimeRemaining'])))+')')		# trusing the rental server for this and not doing the calculation locally (although have all the data to do it), should verify this.......
+	print('total paid :                       '+RoundAndPadToString(Status['total_paid'],0)+' [sat]')
+	print('credit :                           '+RoundAndPadToString(Status['Credit'],0)+' [sat]')
 
-		print('rental rate :                      '+RoundAndPadToString(1/Status['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(Status['CurrentRate']*(3600*24),0)+' [sat/day], '+RoundAndPadToString(Status['CurrentRate']*(3600*24*(365.25/12)),0)+' [sat/month]')
-		print('start time :                       '+FullDateTimeString(Status['start_time'])+' ('+str(timedelta(seconds=ceil(time()-Status['start_time'])))+' ago)')
-		print('paid until :                       '+FullDateTimeString(time()+Status['TimeRemaining'])+' ('+str(timedelta(seconds=ceil(Status['TimeRemaining'])))+')')		# trusing the server for this and not doing the calculation locally (although have all the data to do it), should verify this.......
-		print('total paid :                       '+RoundAndPadToString(Status['total_paid'],0)+' [sat]')
-		print('credit :                           '+RoundAndPadToString(Status['Credit'],0)+' [sat]')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def CompactRentalStatus(Status,LNDBalance=None):
+
+	# TODO: consider combining Total Payments with Total Paid and Time Remaining with Rental Server Credit
+
+	String=''
+
+	if not Status['InitialPayment']:
+		String+='IP Address :                       '+Status['Address']+'\n'
+		String+='Start Time :                       '+FullDateTimeString(Status['start_time'])+' ('+str(timedelta(seconds=ceil(time()-Status['start_time'])))+' ago)'+'\n'
+		String+='Total Paid :                       '+RoundAndPadToString(Status['total_paid'],0)+' [sat], which includes the '+RoundAndPadToString(Status['ActivationFee'],0)+' [sat] Activation Fee'+'\n'
+		String+='Total Payments :                   '+RoundAndPadToString(Status['NumberOfPayments'],0)+'\n'
+
+		String+='Rental Rate :                      '+RoundAndPadToString(1/Status['CurrentRate'],0)+' [seconds/sat] , '+RoundAndPadToString(Status['CurrentRate']*(OneDay),0)+' [sat/day], '+RoundAndPadToString(Status['CurrentRate']*(OneDay*(365.25/12)),0)+' [sat/month]'+'\n'
+
+	if 'Credit' in Status:		# Status is from the rental server
+		CurrentCredit=Status['Credit']
+		TimeRemaining=Status['TimeRemaining']
+	else:						# Status is from TunnelStateFile, so need to calculate the current values
+		CurrentCredit=Credit(Status,time())
+
+		if Status['InitialPayment']:
+			TimeRemaining=None
+		else:
+			TimeRemaining=CurrentCredit/Status['CurrentRate']
+
+	if TimeRemaining is not None:
+		String+='Paid Until :                       '+FullDateTimeString(time()+TimeRemaining)+' ('+str(timedelta(seconds=ceil(TimeRemaining)))+')'+'\n'
+
+	# pad based on the larger number so both line up digits but can still left justify
+	TempCurrentCreditString=RoundAndPadToString(CurrentCredit,1,ShowThousandsSeparator=False)
+	TempCurrentCreditStringLength=len(TempCurrentCreditString)
+	TempCurrentLNDBalanceString=RoundAndPadToString(LNDBalance,0,ShowThousandsSeparator=False)
+	TempCurrentLNDBalanceStringLength=len(TempCurrentLNDBalanceString)
+	PaddingNeeded=max(TempCurrentCreditStringLength-2,TempCurrentLNDBalanceStringLength)
+
+	String+='Rental Server Credit :             '+RoundAndPadToString(CurrentCredit,1,PaddingNeeded)+' [sat]'+'\n'
+
+	if LNDBalance is not None:
+		String+='LND (off chain) account balance :  '+RoundAndPadToString(LNDBalance,0,PaddingNeeded)+'   [sat]'+'\n'
+
+	return String[:-1]			# the [:-1] skips the last character while letting have \n on the end of each line and not have to keep track if move lines around
+
+
+
+
+
+
+
+
+
 
 
 
@@ -323,7 +615,7 @@ def GetConf():
 	print()
 	print('---------------------------------------------------------------------------------------------------')
 	print()
-	TimeStampedPrint(response.json(),prettyprintprepend='tunnel config info',prettyprint=True)
+	logger.info(IndentedPrettyPrint(response.json(),prettyprintprepend='tunnel config info'))
 
 	if 'Error' not in response.json():
 
@@ -332,6 +624,54 @@ def GetConf():
 		print()
 		GenerateConfig(response.json())
 		print()
+
+
+
+def CheckServiceState(ServiceName,SubStateValue='running'):
+	try:
+		unit = Unit(ServiceName+'.service')
+		unit.load()
+
+		logger.debug(ServiceName + ' systemd service is ' + unit.Unit.LoadState.decode() + ', ' + unit.Unit.UnitFileState.decode() + ', ' + unit.Unit.ActiveState.decode() + ', and ' + unit.Unit.SubState.decode())
+
+		if unit.Unit.LoadState.decode() == 'loaded':
+			if unit.Unit.ActiveState.decode() == 'active':
+				if unit.Unit.SubState.decode() == SubStateValue:
+					if unit.Unit.UnitFileState.decode() == 'enabled':
+						logger.debug(ServiceName + ' has met the required SubState value of ' + SubStateValue + ' and it is enabled')
+						# although it can be active without being enabled (manually started), want to make sure it will always be on.
+						# there is something else, UnitFilePreset. think this might be "vendor present". not testing this though.
+						return True
+					else:
+						logger.debug(ServiceName + ' has met the required SubState value of ' + SubStateValue + ' but it is not enabled')
+				elif unit.Unit.SubState.decode() == 'dead':
+					logger.warning('do not understand how the ' + ServiceName + ' service can be loaded, active, and dead')
+				else:
+					logger.debug(ServiceName +' has unexpected SubState value of ' + unit.Unit.SubState.decode())
+			elif unit.Unit.ActiveState.decode() == 'inactive':
+				if unit.Unit.SubState.decode() == 'running':
+					logger.warning('do not understand how the ' + ServiceName + ' service can be loaded, inactive, and running')
+				elif unit.Unit.SubState.decode() == 'dead':
+					logger.debug(ServiceName + ' has a SubState value of ' + SubStateValue + ' that is valid but not acceptable')
+				else:
+					logger.warning(ServiceName +' has unexpected SubState value of ' + unit.Unit.SubState.decode())
+			else:
+				logger.warning(ServiceName + ' has unexpected ActiveState value of ' + unit.Unit.ActiveState.decode())
+		elif unit.Unit.LoadState.decode() == 'not-found':
+			logger.debug(ServiceName +' not found')
+		else:
+			logger.warning(ServiceName +' has unexpected LoadState value of ' + unit.Unit.LoadState.decode())
+	except:
+		logger.debug('can not connect to systemd via dbus')
+
+	return False
+
+
+
+
+
+
+
 
 def GenerateConfig(dict_config):
 
@@ -358,59 +698,819 @@ def GenerateConfig(dict_config):
 
 	# now write to a file #
 
-	WireGuardConfigFileName=dict_config['addresses'][0].replace('/', '-')+'.conf'			#only use the first address for the filename, then replace the / with a -, then add the extension.
+	# only use the first address for the filename, then remove the network prefix because wg-quick uses the filename as the interface name and linux interface names can only be 15 characters long.
+	WireGuardConfigBaseFileName=dict_config['addresses'][0].split('/')[0]
+	# then add the extension.
+	WireGuardConfigFileName=WireGuardConfigBaseFileName+'.conf'
 
-	UserInput = input(
-				'Where to create '+WireGuardConfigFileName+'?\n'+
-				'\n'+
-				'                [0] Don\'t create '+WireGuardConfigFileName+' anywhere.\n'+
-				'                [1] Save to /etc/wireguard/'+WireGuardConfigFileName+' .\n'+
-				'                [2] Save to '+getcwd()+'/'+WireGuardConfigFileName+' .\n'+
-				'\n'+
-				'                 '
-			)
-	print()
-	print()
+	WireGuardConfigFilePath=str(TheDataFolder+'/WireGuardConfigFiles/')
 
+	if not isdir(WireGuardConfigFilePath):
+		makedirs(WireGuardConfigFilePath)
+		logger.debug(WireGuardConfigFilePath+' did not exist, so created it!')
 
-	if UserInput == '1':
-		WireGuardConfigFilePath = '/etc/wireguard/'
-	elif UserInput =='2':
-		WireGuardConfigFilePath = getcwd()+'/'
+	logger.debug('starting write config to '+WireGuardConfigFilePath+WireGuardConfigFileName)
+	with open(WireGuardConfigFilePath+WireGuardConfigFileName, "w") as WireGuardConfigFileHandle:
+		WireGuardConfigFileHandle.write(config.to_wgconfig(wgquick_format=True))
+	logger.info('wrote config to '+WireGuardConfigFilePath+WireGuardConfigFileName)
+
+	RootUser = (geteuid() == 0)
+	if RootUser:
+		try:
+			logger.debug('starting to create a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName)
+			symlink(WireGuardConfigFilePath+WireGuardConfigFileName, '/etc/wireguard/'+WireGuardConfigFileName)
+			logger.info('created a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName)
+		except PermissionError:
+			logger.error('root user but can not create a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName+', permission denied')
+		except FileExistsError:
+			logger.error('root user but can not create a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName+', file already exists')
+		except:
+			logger.error('root user but can not create a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName+', some unknown error')
+			raise
 	else:
-		WireGuardConfigFilePath = None
+			logger.info('not root user, not trying to create a symlink from '+WireGuardConfigFilePath+WireGuardConfigFileName+' to /etc/wireguard/'+WireGuardConfigFileName)
 
-	if WireGuardConfigFilePath is not None:
-		TimeStampedPrint('starting write to '+WireGuardConfigFilePath+WireGuardConfigFileName)
-		with open(WireGuardConfigFilePath+WireGuardConfigFileName, "w") as WireGuardConfigFileHandle:
-			WireGuardConfigFileHandle.write(config.to_wgconfig(wgquick_format=True))
-		TimeStampedPrint('finished write to '+WireGuardConfigFilePath+WireGuardConfigFileName)
 
-		print()
-		print()
-		print(
-				'Use \n'+
-				'\n'+
-				'         wg-quick up '+WireGuardConfigFilePath+WireGuardConfigFileName+'\n'+
-				'\n'+
-				'                ~OR~\n'+
-				'\n'+
-				'         nmcli connection import type wireguard file '+WireGuardConfigFilePath+WireGuardConfigFileName+'\n'+
-				'\n'+
-				'to setup the tunnel on the computer/container/VM that you want to use it with.\n'+
-				''
-			)
-		print()
-		print()
+
+	# now try to configure the system
+
+	if CheckServiceState('NetworkManager'):
+
+		NMInterfaceUP=False
+		logger.info('NetworkManager seems to be installed and running on this system.')
+
+		UFWenabled=False
+		if CheckServiceState('ufw',SubStateValue='exited'):		# ufw seems to be a oneshot service
+			logger.info('and the Uncomplicated Firewall (ufw) systemd service seems to be installed and enabled on this system')
+
+			try:
+				with open('/etc/ufw/ufw.conf') as f:
+					if 'ENABLED=yes' in f.read():
+						UFWenabled=True
+						# TODO: check if running as root and use a ufw python interface to see if it is actually active.
+						logger.warning('and /etc/ufw/ufw.conf indicates Uncomplicated Firewall (ufw) should be enabled, but need to run `sudo ufw status verbose` to check for sure.')
+					else:
+						logger.warning('however, although the ufw systemd service is active, /etc/ufw/ufw.conf indicates Uncomplicated Firewall (ufw) should be disabled')
+						logger.warning('need to run `sudo ufw enable`')
+			except:
+				logger.error('but can not read /etc/ufw/ufw.conf')
+
+			if UFWenabled:
+				logger.info('do you want to start the wireguard tunnel and assign the dedicated public IP address to this system?')
+
+				print()
+				print()
+				UserInput = input('                                                                     [y/N]: ')
+				print()
+				print()
+				if UserInput.casefold() == 'y' or UserInput.casefold() == 'yes':
+					logger.info('bringing up ' + dict_config['addresses'][0] + ' using NetworkManager')
+					# TODO: use a Dbus connection to do this instead of subprocess. also check to see if the connection already exists first. nmcli currently just gives a warning and then disables the duplicate connection, so it "works" as is.
+					RunResult=subprocess.run(
+												[
+													'nmcli',
+													'connection',
+													'import',
+													'type',
+													'wireguard',
+													'file',
+													WireGuardConfigFilePath+WireGuardConfigFileName,
+												],
+												check=True,
+											)
+					NMInterfaceUP=True
+					logger.info('brought up ' + dict_config['addresses'][0] + ' using NetworkManager')
+
+		if not NMInterfaceUP:
+			logger.info('NOT bringing up ' + dict_config['addresses'][0] + ' using NetworkManager')
+
+		if not UFWenabled:
+			logger.warning('Uncomplicated Firewall (ufw) is not in use. You should really have a firewall in use before installing a dedicated public IP address on this system.')
+			logger.warning('get Uncomplicated Firewall (ufw) running and re-run `staticIP GetConf` or if you know what you are doing, manually bring the tunnel interface up using')
+			logger.warning('nmcli connection import type wireguard file '+WireGuardConfigFilePath+WireGuardConfigFileName)
+	else:
+		logger.info('NetworkManager does NOT seem to be installed and running on this system.')
+
+		# second best is to use wg-quick if the root user.
+		if RootUser:
+			logger.info('It appears that staticIP is running as the root user and NetworkManager is not installed.')
+			logger.info('Do you want to temporarily bring the tunnel up and assign the dedicated public IP address to this system using wg-quick?')
+			logger.warning('`staticIP` does not know if you have an active firewall running, so it is your responsibility to make sure there is one.')
+
+			print()
+			print()
+			UserInput = input('                                                                     [y/N]: ')
+			print()
+			print()
+			if UserInput.casefold() == 'y' or UserInput.casefold() == 'yes':
+				logger.info('bringing up ' + dict_config['addresses'][0] + ' using wg-quick')
+				RunResult=subprocess.run(
+											[
+												'wg-quick',
+												'up',
+												WireGuardConfigBaseFileName
+											],
+											check=True,
+										)
+				logger.info('brought up ' + dict_config['addresses'][0] + ' using wg-quick. in order to bring the interface back down, run `wg-quick down '+WireGuardConfigBaseFileName+'`.')
+
+			else:
+				logger.info('NOT bringing up ' + dict_config['addresses'][0] + ' using wg-quick.')
+		else:
+			logger.info('NetworkManager not found and staticIP is not running as the root user. You will need to manually bring up the tunnel interface.')
+			logger.info('If you know what you are doing (i.e. have proper filewall active), manually bring up the interface using')
+			logger.info('sudo wg-quick up '+WireGuardConfigFilePath+WireGuardConfigFileName)
+			logger.info('on the computer/container/VM that you want to use it with.')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################################################
+# AutoPay related functions
+################################################################
+
+
+def Credit(TunnelStateFile,current_time):
+	if not TunnelStateFile['InitialPayment']:
+		return TunnelStateFile['amount_paid_CurrentRate']+TunnelStateFile['Credit_PreviousRate']-(current_time-TunnelStateFile['start_time_CurrentRate'])*TunnelStateFile['CurrentRate']
+	else:
+		# this is actually -SellOfferTerms['ActivationFee'], but that will screw up the calculation of the initial ProposedPaymentSize, so just leaving as 0 and manually calculating Credit in ServerStatusMatchesLocal for the initial payment
+		# and setting the initial TunnelStateFile['Credit_PreviousRate']
+		# TODO: might want to change things so that the initial ProposedPaymentSize includes the activation fee ????
+		return 0
+
+
+def GetSellOfferTerms():
+
+	# TODO: retry on network connection failure.
+	# TODO: add a command line option so that it can be manually run if desired and not just with AutoPay.
+
+	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/GetSellOfferTerms/', verify=False)
+
+	if (response.status_code != 200) or ('Error' in response.json()):
+
+		print(response.status_code)
+		print(response.content)
+
+		raise Exception('rental server API query gave a bad status_code or content.')
+
+	return response.json()
+
+
+def CheckSellOfferTerms(BuyOfferTerms,SellOfferTerms,TunnelStateFile):
+
+	#check to see what passes and doesn't pass. if anything doesn't pass, it doesn't pass. don't just want to use a bunch of elif statements because would like to print everything that doesn't pass, not just the first thing that doesn't pass.
+
+	Passed=True
+
+	if SellOfferTerms['Rate']>BuyOfferTerms['MaxRate']:
+		Passed=False
+		logger.error('rental server rate too high')
+
+	if SellOfferTerms['MaximumCredit']<SellOfferTerms['MinRegularPaymentSize']*2:
+		Passed=False
+		logger.error('rental server cannot have a MaximumCredit less than MinRegularPaymentSize*2')
+
+	if SellOfferTerms['MaximumCredit']<SellOfferTerms['MinimumInitialCredit']:
+		Passed=False
+		logger.error('rental server cannot have a MaximumCredit less than MinimumInitialCredit')
+
+	if TunnelStateFile['InitialPayment']:
+		if SellOfferTerms['ActivationFee']>BuyOfferTerms['MaxActivationFee']:
+			logger.error('rental server activation fee too high')
+			Passed=False
+
+		if SellOfferTerms['MinimumInitialCredit']>BuyOfferTerms['MaxInitialCredit']:
+			logger.error('rental server MinimumInitialCredit too high')
+			Passed=False
+
+	if SellOfferTerms['MinRegularPaymentSize']>BuyOfferTerms['MaxRegularPaymentSize']:
+		logger.error('rental server MinRegularPaymentSize too high')
+		Passed=False
+
+	if Passed:
+		logger.debug('all SellOfferTerms Acceptable, okay to pay')
+
+	return Passed
+
+
+
+def GetAllowableTerms(BuyOfferTerms,SellOfferTerms,TunnelStateFile):		# merge constraints of each.
+
+	BuyOfferTerms=copy(BuyOfferTerms)		#don't want to modify the original
+	AllowableTerms={}
+
+	# before requesting an invoice with a specific amount, apply limits that don't result in a failure.
+
+	if SellOfferTerms['MinRegularPaymentSize']>BuyOfferTerms['MinRegularPaymentSize']:
+		AllowableTerms['MinRegularPaymentSize']=SellOfferTerms['MinRegularPaymentSize']
+		logger.debug('rental server MinRegularPaymentSize higher than local MinRegularPaymentSize, so using the higher amount')
+	else:
+		AllowableTerms['MinRegularPaymentSize']=BuyOfferTerms['MinRegularPaymentSize']
+
+
+
+
+	if BuyOfferTerms['TargetTime']*SellOfferTerms['Rate']<BuyOfferTerms['TargetCredit']:
+		NewTargetCredit=int(ceil(BuyOfferTerms['TargetTime']*SellOfferTerms['Rate']))
+		logger.debug('CurrentRate and TargetTime results an in amount ('+RoundAndPadToString(NewTargetCredit,0)+' sat) that is less than the TargetCredit ('+RoundAndPadToString(BuyOfferTerms['TargetCredit'],0)+' sat), so using the lower amount')
+		BuyOfferTerms['TargetCredit']=NewTargetCredit
 
 	else:
-		TimeStampedPrint('not creating '+WireGuardConfigFileName)
+		logger.debug('CurrentRate and TargetTime results in an amount greater than the TargetCredit, so not making the TargetTime')
+
+
+
+	if TunnelStateFile['InitialPayment']:
+		if BuyOfferTerms['MaxInitialCredit']>SellOfferTerms['MinimumInitialCredit']:
+			AllowableTerms['TargetCredit']=SellOfferTerms['MinimumInitialCredit']
+			logger.debug('rental server MinimumInitialCredit less than allowable MaxInitialCredit, so using the lower amount to minimize risk that the rental server does not ever turn the tunnel on')
+		else:
+			raise Exception('MaxInitialCredit less than rental server MinimumInitialCredit')
+
+	else:
+		if SellOfferTerms['MaximumCredit']<BuyOfferTerms['TargetCredit']:			# rental server should never have it's MaximumCredit less than it's MinimumInitialCredit
+			AllowableTerms['TargetCredit']=SellOfferTerms['MaximumCredit']
+			logger.debug('rental server MaximumCredit less than TargetCredit, so using the lower amount')
+			if SellOfferTerms['MaximumCredit']<BuyOfferTerms['WarningCredit']:
+				logger.warning('low rental server MaximumCredit')
+		else:
+			AllowableTerms['TargetCredit']=BuyOfferTerms['TargetCredit']
+
+
+	if not TunnelStateFile['InitialPayment'] and AllowableTerms['TargetCredit']<AllowableTerms['MinRegularPaymentSize']*2:
+		# not super worried about this one right now on the initial payment because always plan to make another payment immediately. # TODO: figure out an exact minimum based on the CurrentRate and maybe 10 minutes credit and set that as the real minimum in case it is the initial payment.
+		logger.debug('allowable TargetCredit of '+RoundAndPadToString(AllowableTerms['TargetCredit'],0)+' sat is less than allowable MinRegularPaymentSize*2='+RoundAndPadToString(AllowableTerms['MinRegularPaymentSize']*2,0)+' sat, credit is going to go negative. setting TargetCredit to MinRegularPaymentSize*2 to avoid this issue !')
+		AllowableTerms['TargetCredit']=AllowableTerms['MinRegularPaymentSize']*2
+
+	if TunnelStateFile['InitialPayment']:
+		AllowableTerms['PaymentSize']=SellOfferTerms['MinimumInitialCredit']			# always provide the rental server minimum initial payment because plan to make another payment a soon as confirmed the tunnel is running. requires CheckSellOfferTerms() to be run before GetAllowableTerms() to make sure this is a good number here.
+	else:
+		AllowableTerms['PaymentSize']=AllowableTerms['MinRegularPaymentSize']
+		if AllowableTerms['PaymentSize']>BuyOfferTerms['MaxRegularPaymentSize']:
+			raise Exception('PaymentSize greater than MaxRegularPaymentSize.')
+
+
+	return AllowableTerms
+
+
+
+def ServerStatusMatchesLocal(ServerStatus,TunnelStateFile):
+
+	# don't expect percentage error accumulation like in Distributed Charge because error shouldn't grow with time. The universe all moves forward exactly the same, so the time error will be off the about the same each time.
+	# this won't be the case once the cost is changed to be as a function of bandwith or total transferred data, but for now it is okay because cost is only a function of time.
+
+	MaxStartTimeError=10						# seconds
+	MaxCurrentTimeError=MaxStartTimeError				# seconds
+	MaxTimeRemainingError=MaxStartTimeError*2			# seconds
+
+	MaximumCreditError=MaxTimeRemainingError*TunnelStateFile['CurrentRate']		# sat
+
+	Passed=True
+
+	if not TunnelStateFile['InitialPayment'] and (TunnelStateFile['start_time']!=ServerStatus['start_time']):
+		Passed=False
+		logger.error('agreed upon start time no longer matches')
+
+	if TunnelStateFile['InitialPayment'] and ((TunnelStateFile['current_time']-ServerStatus['start_time'])>MaxStartTimeError):			# only care if the rental server thinks the start time was too far in the past
+		Passed=False
+		logger.error('start time too far off')
+
+	if (ServerStatus['current_time']-time())>MaxCurrentTimeError:						# only care if the rental server thinks the start time was too far in the future
+		Passed=False
+		logger.error('current time too far off')
+
+	if TunnelStateFile['ActivationFee'] != ServerStatus['ActivationFee']:
+		Passed=False
+		logger.error('sever thinks a different ActivationFee was initially agreed upon')
+
+	if TunnelStateFile['CurrentRate'] != ServerStatus['CurrentRate']:
+		Passed=False
+		logger.error('sever thinks a different Rate was agreed upon when the last payment was made')
+
+	if TunnelStateFile['InitialPayment']:				# fudge because Credit is set to 0 so that the intial ProposedPaymentSize is calculated correctly.
+		CurrentCredit=-TunnelStateFile['ActivationFee']
+	else:
+		CurrentCredit=Credit(TunnelStateFile,ServerStatus['current_time'])		# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer
+
+	if (CurrentCredit-ServerStatus['Credit'])>MaximumCreditError:
+		Passed=False
+		logger.error('sever credit amount is too low')
+
+	if (CurrentCredit/TunnelStateFile['CurrentRate']-ServerStatus['TimeRemaining'])>MaxTimeRemainingError:		# only care if the rental server thinks the time remaining is too low
+		Passed=False
+		logger.error('rental server credit remaining amount is too low')
+
+
+	if TunnelStateFile['total_paid'] != ServerStatus['total_paid']:
+		Passed=False
+		logger.error('rental server total paid amount is incorrect')
+
+	if TunnelStateFile['NumberOfPayments'] != ServerStatus['NumberOfPayments']:
+		Passed=False
+		logger.error('rental server total number of payments count is wrong')
+
+	return Passed
+
+
+
+def ComputeMainSleepTimeAdder(PaymentSize,TunnelStateFile):
+
+	if TunnelStateFile['InitialPayment']:
+		# CurrentRate is not defined.
+		# won't be sleeping at all at this point anyway, so just return so the function can execute
+		return
+
+	else:
+		#note, NumberChecksBetweenExpectedPayments and OneDay are global constants so they aren't passed into the function explicitly
+
+		# define how much more time until the main code block should be triggered next once the TargetCredit is achieved.
+
+		# should be at TargetCredit if MainSleepTimeAdder is used, so can easily calculate the time (with contant Rates) until the next payment is needed.
+		# don't think the PaymentSize should change after payments are caught up (which is after InitialPayment) and want to
+		# use PaymentSize instead of ProposedPaymentSize because ProposedPaymentSize should be longer
+		TimeNextPaymentNeeded=PaymentSize/TunnelStateFile['CurrentRate']
+
+		# check multiple times in between payment so can detect early if the rental server is in disagreement and also to make sure
+		# the sleep time is low enough (always lower than TimeNextPaymentNeeded) that never go under TargetCredit and it is always
+		# overshot without overshooting too much
+		# also, check at least 4 times per day.
+
+		return min(TimeNextPaymentNeeded/NumberChecksBetweenExpectedPayments,OneDay/4)
 
 
 
 
 
 
+
+
+
+
+
+
+
+
+
+class AutoPay(Thread):
+	def __init__(self,  *args, **kwargs):
+		super(AutoPay, self).__init__(*args, **kwargs)
+		self._stop_event = Event()
+		self.daemon=True		# using daemon mode so control-C will stop the script and the threads and .join() can timeout.
+
+	def stop(self):
+		self._stop_event.set()
+
+	def stopped(self):
+		return self._stop_event.is_set()
+
+	def run(self):
+		self.AutoPay()
+
+
+	def AutoPay(self):	# make a wrapper function so the python logging module outputs something more interesting than `run`.
+
+		# TODO: better handeling of all error reporting, for example, sending a notification e-mail or something before the tunnel just gets turned off because thigns aren't working. have a web dashboard that can be monitored for status ?
+
+
+
+		################################################################
+		#initialize the ConfigFile
+		################################################################
+
+
+		# TODO: figure out how to handle this config if running in the background. make the user always do a first config launch before running in the background ?
+		#        probably, but should make the background service still launchable, but just wait until the config is setup to start.
+
+
+		ChangesToConfigFile=False
+
+		DefaultBuyOfferTerms={
+				'MaxMonthlyRate' :	48000,			# sat/month
+
+				# amount to pay ever time you want to add credit. don't make a payment until the credit drops below this amount.
+				# actual value will be determined based on actual TargetCredit and SellOfferTerms['MinRegularPaymentSize']
+				'MaxRegularPaymentSize' :	1500,			# max
+				'MinRegularPaymentSize' :	550,			# min, should be larger than the server's value.
+
+				'MaxActivationFee' :	64000,
+				'MaxInitialCredit' :	2000,			# don't want to pay the normal prepayment amount right away when initially renting a tunnel until know the tunnel rental server is actually good for something
+
+				'TargetCredit' :		6000,			# amount to try and always have paid up
+				'TargetTime' :		OneDay*5,
+
+#				'WarningCredit' :		3500,
+				}
+
+
+		if ConfigFile.get('BuyOfferTerms') is None:
+			ConfigFile['BuyOfferTerms'] = {}
+
+		for setting in DefaultBuyOfferTerms.keys():
+			if ConfigFile['BuyOfferTerms'].get(setting) is None:
+				logger.info('no '+setting+' found in '+TheDataFolder+ConfigFileName+', please enter the desired value or press ENTER to accept the default')
+
+				while True:
+					try:
+						print()
+						keyboardinput = input('                                                                     '+setting+': ['+str(DefaultBuyOfferTerms[setting])+'] ')
+						print()
+						if keyboardinput != "":
+							integerkeyboardinput=int(keyboardinput)
+						break
+					except ValueError:
+						logger.error(keyboardinput + ' not an integer, try again')
+
+				if keyboardinput == "":
+					ConfigFile['BuyOfferTerms'][setting]=DefaultBuyOfferTerms[setting]
+					extratext='default'
+				else:
+					ConfigFile['BuyOfferTerms'][setting]=integerkeyboardinput
+					extratext='user defined'
+				logger.info('using '+extratext+' '+setting+' = '+str(ConfigFile['BuyOfferTerms'][setting]))
+				ChangesToConfigFile=True
+
+
+		while ConfigFile.get('LNDhost') is None or ConfigFile.get('LNDhost')=='':		# keep asking if no answer provided (can't skip this question!)
+			print()
+			print()
+			ConfigFile['LNDhost'] = input('LNDhost value not found in '+TheDataFolder+ConfigFileName+' please input the value now in the form of `lndconnect://`: ')
+			ChangesToConfigFile=True
+			print()
+			print()
+
+		if ChangesToConfigFile:
+			logger.debug('writing to '+TheDataFolder+ConfigFileName)
+			with open(TheDataFolder+ConfigFileName, 'w') as file:
+				yaml.dump(ConfigFile, file)
+			logger.debug('finished writing to '+TheDataFolder+ConfigFileName)
+		else:
+			logger.debug('no changes to '+TheDataFolder+ConfigFileName)
+
+
+		################################################################
+		#initialize the TunnelStateFile
+		################################################################
+
+
+		ChangesToTunnelStateFile=False
+
+		DefaultTunnelStateFile={
+						'InitialPayment' :			True,
+						'TunnelShouldBeRunning' :	False,
+						'total_paid' :				0,
+						'NumberOfPayments' :		0,
+				}
+
+		if isfile(TheDataFolder+TunnelStateFileName):
+			with open(TheDataFolder+TunnelStateFileName, 'r') as file:
+				TunnelStateFile=yaml.load(file)
+
+			if TunnelStateFile is None:
+				TunnelStateFile={}
+				logger.debug(TheDataFolder+TunnelStateFileName+' is empty!')
+		else:
+			TunnelStateFile={}
+			logger.debug(TheDataFolder+TunnelStateFileName+' does not exist, so creating it!')
+
+		for setting in DefaultTunnelStateFile.keys():
+			if TunnelStateFile.get(setting) is None:
+				TunnelStateFile[setting]=DefaultTunnelStateFile[setting]
+				ChangesToTunnelStateFile=True
+				logger.info('no '+setting+' found in '+TheDataFolder+TunnelStateFileName+', so adding the default value of '+str(DefaultTunnelStateFile[setting]))
+
+		if ChangesToTunnelStateFile:
+			logger.debug('writing to '+TheDataFolder+TunnelStateFileName)
+			with open(TheDataFolder+TunnelStateFileName, 'w') as file:
+				yaml.dump(TunnelStateFile, file)
+			logger.debug('finished writing to '+TheDataFolder+TunnelStateFileName)
+		else:
+			logger.debug('no changes to '+TheDataFolder+TunnelStateFileName)
+
+
+		################################################################
+		# misc setup
+		################################################################
+
+		# now determine calculated values that aren't written to the file
+		ConfigFile['BuyOfferTerms']['MaxRate']=ConfigFile['BuyOfferTerms']['MaxMonthlyRate']/(365.25*OneDay/12)
+		TunnelStateFile['Running']=True		# TODO: need to make it actually check this somewhere!!!!!!!!!!!!!!!
+
+############### TODO: need to revisit this. may not be right, especially since AllowableTerms['TargetCredit']=AllowableTerms['MinRegularPaymentSize']*2 ?
+#		if ConfigFile['BuyOfferTerms']['WarningCredit']<ConfigFile['BuyOfferTerms']['MinRegularPaymentSize']:
+#			logger.warning('WarningCredit is less than MinRegularPaymentSize, credit may go negative')
+
+
+		################################################################
+		# get an initial reading on what the rental server's SellOfferTerms are
+		################################################################
+
+		SellOfferTerms=GetSellOfferTerms()
+		logger.debug(IndentedPrettyPrint(SellOfferTerms,prettyprintprepend='SellOfferTerms'))
+
+
+
+		if not CheckSellOfferTerms(ConfigFile['BuyOfferTerms'],SellOfferTerms,TunnelStateFile):
+			logger.error('SellOfferTerms not acceptable on startup, quitting.')
+			sys.exit()
+
+		################################################################
+		#initialize the LND RPC
+		################################################################
+
+		lnd = LNDClient(ConfigFile['LNDhost'])
+
+		################################################################
+
+
+		# TODO: make auto pay return when credit is full (1-2 payments) OR go forever (currently just runs forever) with a command line option so you can decide if you want this script to be a long running service or something that fires on a timer.
+
+
+		MainSleepTime=time()
+
+		while True:
+
+			if time()>MainSleepTime:		# most things won't be done frequently, but still need to loop regularly for things like checking to see if the thread needs to stop or printing more frequent rental status updates.
+
+				try:
+
+					# reset the time, then add sleeps as needed
+					MainSleepTime=time()
+
+					if TunnelStateFile['InitialPayment'] or TunnelStateFile['Running']:		# only try to make a payment if it is the first payment or the tunnel is already running.
+
+						# see if think it is time to pay using the last fetched SellOfferTerms so don't need to query the rental server on every loop.
+						# if it seems like it's time to pay, will then then query the rental server for up to date information and double check.
+
+						# note, ProposedPaymentSize doesn't include the activation fee because the initial payment already has zero credit (or slightly negative credit) to start with without the
+						# negative component for the activation fee, so all the tests will already yield True without considering the activation fee and CheckSellOfferTerms makes sure the activation
+						# fee is properly included before making the payment. before the initial payment is made, Credit() yields zero even though it's actually negative because can't really
+						# calculate the exact negative credit since start_time_CurrentRate doesn't exist yet until the first invoice is requested and it doesn't make sense to compute a credit for
+						# time before that future time if the value will always be low enough to trigger the tests all yielding True, causing it to try to make a payment.
+
+						AllowableTerms=GetAllowableTerms(ConfigFile['BuyOfferTerms'],SellOfferTerms,TunnelStateFile)
+
+						MainSleepTimeAdder=ComputeMainSleepTimeAdder(AllowableTerms['PaymentSize'],TunnelStateFile)
+
+						logger.debug(IndentedPrettyPrint(AllowableTerms,prettyprintprepend='AllowableTerms'))
+
+						# Note: TargetCredit is the lower of the rental server's max credit is and the buyer's target credit.
+						# also, pay a little bit early and potentially overshoot the target (by 1/(NumberChecksBetweenExpectedPayments-1) %) so can have a longer MainSleepTime
+						# note, the goal is to not exceed TargetCredit and (TargetCredit-PaymentSize) should be sufficiently greater than 0. if (TargetCredit-MinRegularPaymentSize*2)<0, GetAllowableTerms will
+						# increase the target, but if the machine may be offline sometimes, the TargetCredit should be increased.
+						ProposedPaymentSize = AllowableTerms['TargetCredit']+int(AllowableTerms['PaymentSize']*(1/(NumberChecksBetweenExpectedPayments-1))) - int(ceil(Credit(TunnelStateFile,time())))
+
+						logger.info(IndentedPrettyPrint(CompactRentalStatus(TunnelStateFile,LNDBalance=lnd.channel_balance().local_balance.sat),'Status',PrettyPrint=False))
+
+						logger.debug('proposed payment size: '+RoundAndPadToString(ProposedPaymentSize,0)+' sat')
+
+						# only pay if the proposed payment size is greater than the allowed payment size. note: the buyer and the seller indirectly limit the maximum ProposedPaymentSize by defining the
+						# TargetCredit. if a payment is skipped, a larger payment may be required, but the TargetCredit helps to keep that under control because the ProposedPaymentSize will never
+						# be bigger than the TargetCredit+any back payments if the Credit goes negative (and if the Credit goes too negative, the tunnel is just turned off).
+						if ProposedPaymentSize >= AllowableTerms['PaymentSize']:
+
+							# before requesting an invoice, see what the rental server is now offering as far as sale terms go.
+							logger.debug('running GetSellOfferTerms')
+							SellOfferTerms=GetSellOfferTerms()
+							logger.debug('done GetSellOfferTerms')
+
+
+							if TunnelStateFile['InitialPayment']:
+								# don't let the server change the activation fee after the inital payment, so remember it as long as the initial payment is actually sent below.
+								TunnelStateFile['ActivationFee']=SellOfferTerms['ActivationFee']
+							else:
+								# ignore the ActivationFee because we should be locked into our previous value
+								SellOfferTerms.pop('ActivationFee')
+
+							# check if agree to the terms
+							if CheckSellOfferTerms(ConfigFile['BuyOfferTerms'],SellOfferTerms,TunnelStateFile):
+
+								# with the updated SellOfferTerms, still need to pay now?
+								AllowableTerms=GetAllowableTerms(ConfigFile['BuyOfferTerms'],SellOfferTerms,TunnelStateFile)
+								MainSleepTimeAdder=ComputeMainSleepTimeAdder(AllowableTerms['PaymentSize'],TunnelStateFile)
+								ProposedPaymentSize = AllowableTerms['TargetCredit']+int(AllowableTerms['PaymentSize']*(1/(NumberChecksBetweenExpectedPayments-1))) - int(ceil(Credit(TunnelStateFile,time())))
+								if ProposedPaymentSize >= AllowableTerms['PaymentSize']:
+
+									# get the invoice and final commitment of SellOfferTerms that are sent in the exact same message as the invoice.
+									# needed to do the previous query to make sure the proposed payment size was good and also to avoid an unnecessary invoice being generated if we didn't actually agree to the SellOfferTerms.
+
+									logger.debug('requesting the invoice')
+									# TODO: retry on network connection failure.
+									# TODO: separate this out into a separate function and combine with the AddCredit function
+									response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/AddCredit/', data={'WireGuardPubKey': ConfigFile['public_key'], 'amount': ProposedPaymentSize},verify=False)
+									logger.debug('done requesting the invoice')
+
+									if response.status_code != 200:
+
+										logger.error(response.status_code)
+										logger.error(response.content)
+
+										raise Exception('rental server API query gave a bad status_code.')
+
+
+									if 'Error' in response.json():
+										logger.error(IndentedPrettyPrint(response.json(),prettyprintprepend='config'))
+										raise Exception('rental server API gave an error response.')
+
+
+									if TunnelStateFile['InitialPayment'] and not response.json()['InitialInvoice']:
+										raise Exception('This should be the initial payment but the rental server does not think so.')
+
+									elif not TunnelStateFile['InitialPayment'] and response.json()['InitialInvoice']:
+										raise Exception('This should not be the initial payment but the rental server thinks it should be.')
+
+									FinalSellOfferTerms=response.json()['SellOfferTerms']
+
+									Invoice=response.json()['Invoice']
+									DecodedInvoice = decode(Invoice)
+									InvoiceAmount=int(DecodedInvoice.amount/1000)
+
+									ServerStatus=response.json()['Status']		# Status is always bundled in with an invoice request so don't need to make a separate call for that too.
+									logger.debug(IndentedPrettyPrint(ServerStatus,prettyprintprepend='ServerStatus'))
+
+									## make sure the invoice received has sensible values and that agree with the rental server on what they are supposed to be ##
+
+									# check to make sure the state of the tunnel according to the rental server matches that of the local knowledge.
+									# but don't check on the initial payment, because some variables are undefined and it doesn't matter on the initial payment.
+									if not TunnelStateFile['InitialPayment'] and not ServerStatusMatchesLocal(ServerStatus,TunnelStateFile):
+										raise Exception('rental server tunnel status values do not match the local values.')
+
+									# check to make sure the amount is the value that was requested
+									if response.json()['AddedCredit'] != ProposedPaymentSize:
+										raise Exception('added credit the rental server is applying if the invoice is paid does not match what was requested.')
+
+									# check to make sure itemized amounts total to the invoice amount
+									if TunnelStateFile['InitialPayment']:
+										if TunnelStateFile['ActivationFee']+ProposedPaymentSize != InvoiceAmount:
+											raise Exception('itemized amounts from rental server do not add up to the total invoice amount.')
+
+									# check to make sure the rental server is consistent with its use of time
+									if ServerStatus['current_time'] != DecodedInvoice.timestamp:
+										logger.warning('rental server Status time does not match invoice time, seems as though this invoice has been re-requested')
+
+
+									# now that we are okay with the invoice we received, make sure the final SellOfferTerms received with the invoice haven't been changed by the rental server since the last query
+									# TODO: might want move this first if ServerStatusMatchesLocal depend on SellOfferTerms ?
+									# TODO / note: some sell offer terms could cause the rental server to give an error response if they changed and the ProposedPaymentSize is not within it's range, so should
+									#              have some better error handeling to check for that.
+
+									if FinalSellOfferTerms==SellOfferTerms:
+										# when providing the invoice, seller didn't change the terms since the last query so,
+											# we don't need to re-test that it is definitely still time to pay
+											# we don't need to re-test to see if the offer terms are still acceptable
+
+										# TODO:	now that everything has passed, print more informational reporting of terms of sale that are going to be
+										#	accepted/used and the current state like is done for manual payments, but in a log file format.
+
+										try:
+
+											logger.info("sending payment for "+RoundAndPadToString(InvoiceAmount,0)+' [sat]')
+											PaymentResponse=lnd.send_payment(Invoice)			#seems to block code execution until the payment is routed, or fails
+
+										except:
+											# TODO:
+											#        - check the response from lnd.send_payment to see what actually happened. lnd.send_payment doesn't fail (raise a python exception)
+											#          if the payment fails to route, only if lnd.send_payment can't contact the lnd node.
+											#        - retry if it is a network connection issue.
+											logger.error("tried sending payment but there was probably a network connection issue")
+											sleep(.25)
+
+											raise
+
+										else:
+
+											logger.info("sent payment: total hops = "+str(len(PaymentResponse.payment_route.hops))+', total fees = '+RoundAndPadToString(PaymentResponse.payment_route.total_fees,0)+' [sat] ('+RoundAndPadToString(100*(PaymentResponse.payment_route.total_fees/InvoiceAmount),2)+'%)')
+											ServerStatusAfterPayment=RentalStatus(Invoice)
+
+											if TunnelStateFile['InitialPayment']:
+												TunnelStateFile['InitialPayment']=False
+												TunnelStateFile['Credit_PreviousRate']=-TunnelStateFile['ActivationFee']		# manually set this because Credit returns 0 for the InitialPayment right now
+# this calculation is different from what the server does, but because the start_time_CurrentRate is not enforced between the two and because the PreviousRate is always the same as the sale offer terms for the first payment, it should still work out the same.
+# could force the server to do the same thing and use the same start_time_CurrentRate as start_time for the first payment.... it probably won't matter and may be simpler as long as they are consistent because they will calculate the same Credit when they do
+# their regular credit checks.
+
+												TunnelStateFile['Address']=ServerStatusAfterPayment['Address']			# need to use the new ServerStatus because now the Address will be populated
+												TunnelStateFile['start_time']=ServerStatus['current_time']				# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer
+											else:
+												TunnelStateFile['Credit_PreviousRate']=Credit(TunnelStateFile,ServerStatus['current_time'])	# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer
+											# the new rate takes effect when the invoice is paid. here it is assumed that the invoice is paid immediately upon receipt of the invoice and
+											# that the invoice was generated right now, that's why there is a warning above if the rental server Status time does not match invoice time
+											# the server still assumes that the new rate takes affect whenever the invoice is paid. this is inconsistent, but the server doesn't require the
+											# invoice to be paid immediately (it has a long expiration for renewal invoices). however, maybe expiration time should be reduced to a short amount
+											# and/or the protocol should be changed to say that the new rate takes effect when the invoice is generated. or, maybe the rate should have an expiration
+											# time defined when it is originally agreed upon (which is probably the best). in that case, if the user chooses to pay far in advance beyond the rate
+											# is good for, that is their risk, or maybe the rental server could offer different rates based on how much they want to prepay.
+											TunnelStateFile['start_time_CurrentRate']=ServerStatus['current_time']					# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer
+											TunnelStateFile['amount_paid_CurrentRate']=InvoiceAmount
+											TunnelStateFile['total_paid']+=TunnelStateFile['amount_paid_CurrentRate']
+											TunnelStateFile['NumberOfPayments']+=1
+											TunnelStateFile['CurrentRate'] = SellOfferTerms['Rate']				# this must come after the Credit_PreviousRate calculation
+
+
+											logger.debug('writing to '+TheDataFolder+TunnelStateFileName)
+											with open(TheDataFolder+TunnelStateFileName, 'w') as file:
+												yaml.dump(TunnelStateFile, file)
+											logger.debug('finished writing to '+TheDataFolder+TunnelStateFileName)
+
+											logger.info(IndentedPrettyPrint(CompactRentalStatus(TunnelStateFile,LNDBalance=lnd.channel_balance().local_balance.sat),'Status',PrettyPrint=False))
+
+											logger.debug(IndentedPrettyPrint(TunnelStateFile,prettyprintprepend='TunnelStateFile'))
+
+
+											# once the payment has been made and locally recorded, check and see if the rental server acknowledges that it got it.
+
+											# check again to make sure the state of the tunnel according to the rental server matches that of the local knowledge.
+											# we would like to know now rather than later that we are out of agreement with the rental server
+											# TODO: move this somewhere else so it is checked whenever time()>MainSleepTime happens so can tell if the server is in disagreement long before the tunnel gets disabled ?????????
+											if not ServerStatusMatchesLocal(ServerStatusAfterPayment,TunnelStateFile):
+												if TunnelStateFile['InitialPayment']:
+													raise Exception('this should definitely never happen on InitialPayment, some kind of local software bug')
+												else:
+													raise Exception('after payment, rental server tunnel status values do not match the local values.')
+
+
+											# note: don't share the above "if TunnelStateFile['InitialPayment'] statement" because want to make sure all that
+											# stuff is written to the file first so the state doesn't get messed up if this errors out. however, then need the extra
+											# TunnelShouldBeRunning variable since InitialPayment is already changed to False. however, this new variable may be useful
+											# for restarting the tunnel after a reboot.
+											if TunnelStateFile['TunnelShouldBeRunning']:
+												# TODO: make the script check for tunnel being active on startup and resetup if it's not active
+												pass
+											else:
+
+												# get the config and setup the tunnel interface.
+												GetConf()
+
+												TunnelStateFile['TunnelShouldBeRunning']=True
+
+												logger.debug('writing to '+TheDataFolder+TunnelStateFileName)
+												with open(TheDataFolder+TunnelStateFileName, 'w') as file:
+													yaml.dump(TunnelStateFile, file)
+												logger.debug('finished writing to '+TheDataFolder+TunnelStateFileName)
+
+												# re-create the lnd object because a new internet connection is in place now and want
+												# to force the creation of a new TCP socket because the existing one won't work (they will time out after a while).
+												lnd = LNDClient(ConfigFile['LNDhost'])
+
+												# also requests seems to also re-use TCP connections and it won't even time them out by default (https://docs.python-requests.org/en/latest/user/advanced/#timeouts),
+												# so tell it to close too. don't need to recreate the SecureSession object though, it seems to auto reconnect (after a few seconds)? if manually closed.
+												SecureSession.close()
+
+
+										# no MainSleepTimeAdder applied to MainSleepTime here though because want to loop again right away to make sure
+										# the TargetCredit is achieved for sure (which it won't at first since the initial credit is always set to a low value
+										# because want to wait until confirm the rental server actually gives a tunnel before paying more).
+
+									else:
+										logger.error('rental server changed the SellOfferTerms at the last minute')
+										logger.error(IndentedPrettyPrint(FinalSellOfferTerms,prettyprintprepend='FinalSellOfferTerms'))
+										logger.error(IndentedPrettyPrint(SellOfferTerms,prettyprintprepend='SellOfferTerms'))
+										MainSleepTime+=60		# wait a while because something obviously went wrong.
+										# we need to repeat the loop and see if the terms are still acceptable and then re-propose a payment size and ask for an invoice of that size
+
+								else:
+									logger.debug('according to the updated rental server SellOfferTerms, not actually time to pay yet')
+									MainSleepTime+=MainSleepTimeAdder		# don't want to ping the rental server all the time, so wait a bit longer (need to have a credit large enough for this delay to be okay though)
+
+							else:
+								logger.error('do not agree to the terms')
+								MainSleepTime+=300	# hope the rental server changes their terms soon
+								# need to fail informationally somehow, sending a notification e-mail.
+
+						else:
+							logger.debug('not yet time to pay')
+							MainSleepTime+=MainSleepTimeAdder		# don't want to ping the rental server all the time, so wait a bit longer (need to have a credit large enough for this delay to be okay though)
+
+					else:
+						logger.error('tunnel not running for some reason, not trying to make any payments until it comes online')
+						MainSleepTime+=60
+				except:
+
+
+					raise
+					# TODO: properly write details about caught exceptions to the log file.
+					# TODO: handle the error properly instead if raising it.
+					# if there is an error, wait to try again.
+					#MainSleepTime+=10
+
+			else:
+				sleep(0.1)
+
+				 # probably makes more sense to check for stopping after the sleep and not before the sleep because the sleep probably takes longer than the main loop itself and don't want to do another loop.
+				if self._stop_event.is_set():	#exit the thread at a safe time
+					logger.debug('stopped autopay safely')
+					return
 
 
 
@@ -434,10 +1534,50 @@ elif arguments.Action == 'GetRentalStatus':
 elif arguments.Action == 'GetConf':
 	GetConf()
 elif arguments.Action == 'AutoPay':
-	print('AutoPay not yet implemented')
+
+	ShutdownRequested=False
+
+	AutoPayThread=AutoPay()
+	AutoPayThread.start()
+
+
+	while True:
+		try:
+			# wait around until it is time to tell AutoPayThread to stop
+			# want this loop and exception catcher to be while doing nothing important so that it doesn't terminate something important
+			# and threads don't see these shutdown messages, so they aren't interfeared until they see a stop signal that is sent after
+			# cleanly catching the exception.
+
+			if AutoPayThread.is_alive():
+				if ShutdownRequested:
+					logger.error('threads did not shut down on their own, terminating them')
+					break
+				else:
+					# nothing to do
+					sleep(.1)
+			else:
+				if ShutdownRequested:
+					logger.debug('threads shut down on their own after being asked')
+					break
+				else:
+					logger.debug('threads shut down on their own without being asked')
+					break
+
+		except (KeyboardInterrupt, SystemExit):
+			logger.info('shutdown requested')
+			ShutdownRequested=True
+
+			logger.debug('shutting threads down')
+			AutoPayThread.stop()
+
+			# note: .join(3) returns after 3 seconds OR when the thread joins/quits, whichever is sooner.
+			# so, need to check .is_alive() above to see if the thread actually is still running.
+			AutoPayThread.join(3)
+
 else:	#should never get here because "choices" defined above should error out first.
 	raise Exception('invalid action')
 
+logger.info('shutdown complete')
 print()
 print()
 

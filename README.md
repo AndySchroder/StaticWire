@@ -15,9 +15,11 @@ Although it is undesirable to require proxy services such as StaticWire, it's be
 
 ## Development Status ##
 
-StaticWire is currently available to test as a client with the command line tool `staticIP`. Details for installing and using this *alpha* tool are provided below. This command line tool currently requires manual payments, but an auto payment daemon similar to [Distributed Charge](http://andyschroder.com/DistributedCharge/) is currently under development. The rental server's source code is also under testing and development and is not yet ready for public release.
+StaticWire is currently available to test as a client with the command line tool `staticIP`. Details for installing and using this *alpha* tool are provided below.
 
-The command line tool `staticIP` generates a private/public key pair for the tunnel locally and the public key is shared with the rental server to identify the customer. When the public key is provided to the rental server, a bitcoin lightning invoice is provided. Once the invoice has been paid, tunnel configuration details are provided to the payer. The payer is currently responsible for using the `staticIP` tool to monitor the credit they have with the rental server and for fetching renewal invoices and making payments (in order to keep the tunnel active).
+The command line tool `staticIP` generates a private/public key pair for the tunnel locally and the public key is shared with the rental server to identify the customer. When the public key is provided to the rental server, a bitcoin lightning invoice is provided. Once the invoice has been paid, tunnel configuration details are provided to the payer.
+
+This command line tool currently allows for manual *OR* automated payments, but you can't mix the two payment modes currently. The rental server's source code is also under testing and development and is not yet ready for public release.
 
 
 
@@ -25,7 +27,6 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 
 - Only supports IPv4.
 - Only supports /32 prefix sizes (single IP address).
-- Need to manually pay for each month's rent.
 - Server source code has not yet been published.
 
 
@@ -51,7 +52,9 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 ### Normal Local User ###
 
 ```bash
-apt install -y python3-pip git
+sudo apt update
+sudo apt install -y python3-pip git libsystemd-dev pkg-config
+sudo apt install -y resolvconf traceroute wireguard-tools          # optional
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
 ```
 
@@ -59,7 +62,9 @@ pip3 install git+https://github.com/AndySchroder/StaticWire.git
 ### Python virtualenv ###
 
 ```bash
-apt install -y python3-pip git
+sudo apt update
+sudo apt install -y python3-pip git libsystemd-dev pkg-config
+sudo apt install -y resolvconf traceroute wireguard-tools          # optional
 python3 -m venv venv
 source venv/bin/activate
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
@@ -67,6 +72,8 @@ pip3 install git+https://github.com/AndySchroder/StaticWire.git
 
 
 ### Docker ###
+
+Warning: This `docker-compose.yml` file includes the `NET_ADMIN` capability in order to allow `staticIP` to automatically create the wireguard network interface.
 
 ```bash
 git clone https://github.com/AndySchroder/StaticWire.git
@@ -88,6 +95,8 @@ to get a shell inside the docker container.
 
 ## Usage ##
 
+### Command Line Options ####
+
 After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides a dedicated public static IP address.
 
 ```
@@ -97,11 +106,50 @@ usage: staticIP [-h] [--amount AMOUNT] {AddCredit,GetRentalStatus,GetConf,AutoPa
 - `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made.
 - `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments.
 - `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`.
-- `AutoPay` runs continuously and uses stored LND credentials to automatically pay invoices (not yet implemented).
-- `--amount AMOUNT` allows the amount of credit that you want to add to be specified (the default is 24,000) [sat].
+- `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.
+- `--amount AMOUNT` allows the amount of credit that you want to add to be specified when using `AddCredit` (the default is 24,000) [sat].
+  
+  
 
-  
-  
+### General ###
+
+- Informational output is written to standard output and debug output is written to `$HOME/.StaticWire/debug.log`.
+- Only once instance of `staticIP` can be run on a machine at a time.
+- Wireguard configuration files are written to `$HOME/.StaticWire/WireGuardConfigFiles/` and soft linked to `/etc/wireguard/` if possible.
+- Hitting `Control+C` (`SIGINT`) or killing with a `SIGTERM` (`kill -15`) will attempt to gracefully shutdown `staticIP`.
+
+
+### AutoPay ###
+
+StaticWire's AutoPay mode uses [lndconnect](https://github.com/LN-Zap/lndconnect/blob/master/lnd_connect_uri.md) to connect to your lnd node's gRPC interface and make automated payments. lndconnect allows you to copy and paste a single (long!) string which provides the necessary information for StaticWire connect to your lnd node, verify that StaticWire's connection to your node is secure, and authenticate StaticWire to the node. Copy and Pasting this single string allows you to easily configure a StaticWire client on a machine in the field ssh, inside a docker container, or inside a virtual machine. You will be prompted to paste this string when you first run `staticIP AutoPay`.
+
+Since we are trusting a script to automatically make payments we want to limit that trust for several reasons:
+
+1. This is experimental software.
+2. You may want to use this software on a machine that doesn't have high physical or system security.
+
+Lightning Terminal (`litd`) now gives lnd the ability to have multiple accounts. Follow these instructions to create a custom macaroon with limited spending capabilities using Lightning Terminal's `litcli` and create an [lndconnect URI](https://github.com/LN-Zap/lndconnect/blob/master/lnd_connect_uri.md) for it.
+
+- Install `litd` and `litcli` (see https://docs.lightning.engineering/lightning-network-tools/lightning-terminal/get-lit).
+- Install `lndconnect` (see https://github.com/LN-Zap/lndconnect#installing-lndconnect).
+- `litcli accounts create 150000 --save_to StaticWireTest.macaroon`
+   - This creates an isolated account with only 150,000 sats allocated to it.
+   - Make sure the record the `id` value. This will later be needed when trying to adjust the balance or to remove the account.
+- `lndconnect -j --host=HostNameOrIPAddress --port=10009 --tlscertpath=/home/YourUserName/.lnd/tls.cert --adminmacaroonpath=StaticWireTest.macaroon`
+   - Note, we didn't actually create an admin macaroon with the `litcli` command above. `lndconnect` doesn't have an option to use a general macaroon, so we tricked it. Since the lndconnect specification doesn't actually differentiate between the different types of macaroons we can just tell `lndconnect` that any macaroon is the admin macaroon.
+   - If you are running StaticWire on your lightning node directly, use `localhost` for the `host`.
+- If you need to increase the balance of the account, you will need to either send more to it using normal lightning payments (however, please be aware of `https://github.com/lightninglabs/lightning-terminal/issues/494`), or use litcli to adjust the balance using `litcli accounts update --id=IDYouRecordedAbove --new_balance=250000`.
+- When you need to remove the account, just deleting the original `StaticWireTest.macaroon` file is not sufficient, you need to run `litcli accounts remove --id=IDYouRecordedAbove`.
+
+
+### Known Issues With AutoPay ###
+
+- Making a manual payment with `staticIP AddCredit` will not be known to `staticIP AutoPay` and then it will stop paying because it is in disagreement the rental server.
+- There isn't currently a way to detect if the rental server is providing an active tunnel and `staticIP AutoPay` will keep paying as long as the sale terms are within its limits. Just like [Distributed Charge](http://andyschroder.com/DistributedCharge/) `staticIP AutoPay` should stop paying the terms of sale aren't satisfied (don't trust, verify!).
+- Lightning Network routing fees don't have any limits on them.
+- `staticIP` needs to be stopped and restarted to reload settings in `Config.yaml`.
+- `staticIP` should detect if it is running on the same machine as your lightning node and if so, only ask which macaroon to use rather than require a full lndconnect URI.
+
 ________________________________________________________________
 
 ## Copyright ##

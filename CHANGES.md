@@ -2,6 +2,13 @@ Change Log
 ===========
 
 
+v0.13-alpha
+----------
+Initial IPv6 support
+
+- IPv6 is now supported _inside_ the tunnel, but not _outside_ the tunnel.
+
+
 v0.12-alpha
 ----------
 AutoPay proof of concept
@@ -14,9 +21,6 @@ AutoPay proof of concept
 - Use the python `logging` module, writing to both standard output and to a file.
 - Updated `AddCredit` to use the new rental server API that accommodates `AutoPay`.
 - The `docker-compose.yml` file now includes the `NET_ADMIN` capability in order to allow `staticIP` to automatically create the wireguard network interface.
-
-
-
 
 
 v0.11-alpha

@@ -17,18 +17,20 @@ Although it is undesirable to require proxy services such as StaticWire, it's be
 
 StaticWire is currently available to test as a client with the command line tool `staticIP`. Details for installing and using this *alpha* tool are provided below.
 
-The command line tool `staticIP` generates a private/public key pair for the tunnel locally and the public key is shared with the rental server to identify the customer. When the public key is provided to the rental server, a bitcoin lightning invoice is provided. Once the invoice has been paid, tunnel configuration details are provided to the payer.
+StaticWire provides both IPv4 and IPv6 subnets inside the tunnel. You can use StaticWire to host services, or if you don't have IPv6 support provided by your internet service provider, you can use StaticWire as a way to get IPv6 connectivity.
 
-This command line tool currently allows for manual *OR* automated payments, but you can't mix the two payment modes currently. The rental server's source code is also under testing and development and is not yet ready for public release.
+The command line tool `staticIP` generates a private/public key pair for the tunnel locally and the public key is shared with the rental server to identify the customer. When the public key is provided to the rental server, a bitcoin lightning invoice is provided. Once the invoice has been paid, tunnel configuration details are provided to the payer.
 
 
 
 ### Current limitations: ###
 
-- Only supports IPv4.
-- Only supports /32 prefix sizes (single IP address).
-- Server source code has not yet been published.
-
+- IPv4
+    - Only supports renting the `/32` prefix (subnet) size (single IP address).
+- IPv6
+    - Only supports renting the `/64` prefix (subnet) size (18,446,744,073,709,551,616 IP addresses).
+    - Supported _inside_ the tunnel, but not _outside_ the tunnel.
+- The command line tool allows for manual *OR* automated payments, but you can't mix the two payment modes.
 
 
 ### Current Terms of Sale (subject to change) ###
@@ -97,7 +99,7 @@ to get a shell inside the docker container.
 
 ### Command Line Options ####
 
-After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides a dedicated public static IP address.
+After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides dedicated public static IP Networks.
 
 ```
 usage: staticIP [-h] [--amount AMOUNT] {AddCredit,GetRentalStatus,GetConf,AutoPay}
@@ -115,6 +117,7 @@ usage: staticIP [-h] [--amount AMOUNT] {AddCredit,GetRentalStatus,GetConf,AutoPa
 
 - Informational output is written to standard output and debug output is written to `$HOME/.StaticWire/debug.log`.
 - Only once instance of `staticIP` can be run on a machine at a time.
+- Wireguard configuration files assign the first IPv6 address in your subnet to the tunnel. However, you are free to route the remaining addresses in your subnet to other machines in your network.
 - Wireguard configuration files are written to `$HOME/.StaticWire/WireGuardConfigFiles/` and soft linked to `/etc/wireguard/` if possible.
 - Hitting `Control+C` (`SIGINT`) or killing with a `SIGTERM` (`kill -15`) will attempt to gracefully shutdown `staticIP`.
 

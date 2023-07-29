@@ -33,6 +33,7 @@ from datetime import datetime,timedelta
 from helpers2 import RoundAndPadToString,IndentedPrettyPrint,SetPrintWarningMessages,FullDateTimeString;SetPrintWarningMessages(True)
 from threading import Thread,Event
 from pystemd.systemd1 import Unit
+from base64 import b64decode,urlsafe_b64encode
 
 # use ruamel.yaml to try and get more desireable indentation of the output
 # ruamel.yaml claims it is so much better than PyYAML, but it is not really that much better.
@@ -108,7 +109,7 @@ CatchKill()
 # parse the command line
 ################################################################
 
-parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP addresses using bitcoin lightning payments")
+parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP Networks using bitcoin lightning payments")
 parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.")
 parser.add_argument('--amount', default=24000,type=int,help="allows the amount of credit that you want to add to be specified when using `AddCredit` (default: %(default)s) [sat].")
 arguments=parser.parse_args()
@@ -426,14 +427,14 @@ def AddCredit(amount):
 			print()
 			print('---------------------------------------------------------------------------------------------------')
 			print()
-			logger.info('adding credit for static IP address '+Status['Address'])
+			logger.info('adding credit for IP Networks '+str(Status['Networks']))
 			print()
 
 		else:
 			print()
 			print('---------------------------------------------------------------------------------------------------')
 			print()
-			logger.info('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel and static IP address with an initial credit amount of '+RoundAndPadToString(amount,0)+' [sat]')
+			logger.info('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel with an initial credit amount of '+RoundAndPadToString(amount,0)+' [sat]')
 			print()
 
 			NewRemainingTime=AddedTime
@@ -455,7 +456,7 @@ def AddCredit(amount):
 		print('total invoice amount :             '+RoundAndPadToString(DecodedInvoice.amount/1000,0)+' [sat]')
 
 		if response.json()['InitialInvoice'] == True:
-			print('one time address activation fee:   '+RoundAndPadToString(response.json()['SellOfferTerms']['ActivationFee'],0)+' [sat]')
+			print('one time tunnel activation fee:   '+RoundAndPadToString(response.json()['SellOfferTerms']['ActivationFee'],0)+' [sat]')
 
 			if response.json()['SellOfferTerms']['ActivationFee']+response.json()['AddedCredit'] != DecodedInvoice.amount/1000:
 				raise Exception('itemized amounts from rental server do not add up to the total invoice amount.')
@@ -551,7 +552,7 @@ def CompactRentalStatus(Status,LNDBalance=None):
 	String=''
 
 	if not Status['InitialPayment']:
-		String+='IP Address :                       '+Status['Address']+'\n'
+		String+='IP Networks :                       '+str(Status['Networks'])+'\n'
 		String+='Start Time :                       '+FullDateTimeString(Status['start_time'])+' ('+str(timedelta(seconds=ceil(time()-Status['start_time'])))+' ago)'+'\n'
 		String+='Total Paid :                       '+RoundAndPadToString(Status['total_paid'],0)+' [sat], which includes the '+RoundAndPadToString(Status['ActivationFee'],0)+' [sat] Activation Fee'+'\n'
 		String+='Total Payments :                   '+RoundAndPadToString(Status['NumberOfPayments'],0)+'\n'
@@ -698,8 +699,9 @@ def GenerateConfig(dict_config):
 
 	# now write to a file #
 
-	# only use the first address for the filename, then remove the network prefix because wg-quick uses the filename as the interface name and linux interface names can only be 15 characters long.
-	WireGuardConfigBaseFileName=dict_config['addresses'][0].split('/')[0]
+	# use 'sw_' + 'first 12 characters of the wireguard public key' for the filename, because wg-quick uses the filename as the interface name and linux interface names can only be 15 characters long.
+	# also, convert the public key from base64 to urlsafe base64 so that a valid name can be ensured
+	WireGuardConfigBaseFileName='sw_'+urlsafe_b64encode(b64decode(ConfigFile['public_key'])).decode()[:12]
 	# then add the extension.
 	WireGuardConfigFileName=WireGuardConfigBaseFileName+'.conf'
 
@@ -756,7 +758,7 @@ def GenerateConfig(dict_config):
 				logger.error('but can not read /etc/ufw/ufw.conf')
 
 			if UFWenabled:
-				logger.info('do you want to start the wireguard tunnel and assign the dedicated public IP address to this system?')
+				logger.info('do you want to start the wireguard tunnel and assign the dedicated public IP Networks to this system?')
 
 				print()
 				print()
@@ -764,7 +766,7 @@ def GenerateConfig(dict_config):
 				print()
 				print()
 				if UserInput.casefold() == 'y' or UserInput.casefold() == 'yes':
-					logger.info('bringing up ' + dict_config['addresses'][0] + ' using NetworkManager')
+					logger.info('bringing up ' + str(dict_config['addresses']) + ' using NetworkManager')
 					# TODO: use a Dbus connection to do this instead of subprocess. also check to see if the connection already exists first. nmcli currently just gives a warning and then disables the duplicate connection, so it "works" as is.
 					RunResult=subprocess.run(
 												[
@@ -779,13 +781,13 @@ def GenerateConfig(dict_config):
 												check=True,
 											)
 					NMInterfaceUP=True
-					logger.info('brought up ' + dict_config['addresses'][0] + ' using NetworkManager')
+					logger.info('brought up ' + str(dict_config['addresses']) + ' using NetworkManager')
 
 		if not NMInterfaceUP:
-			logger.info('NOT bringing up ' + dict_config['addresses'][0] + ' using NetworkManager')
+			logger.info('NOT bringing up ' + str(dict_config['addresses']) + ' using NetworkManager')
 
 		if not UFWenabled:
-			logger.warning('Uncomplicated Firewall (ufw) is not in use. You should really have a firewall in use before installing a dedicated public IP address on this system.')
+			logger.warning('Uncomplicated Firewall (ufw) is not in use. You should really have a firewall in use before installing a dedicated public IP Network on this system.')
 			logger.warning('get Uncomplicated Firewall (ufw) running and re-run `staticIP GetConf` or if you know what you are doing, manually bring the tunnel interface up using')
 			logger.warning('nmcli connection import type wireguard file '+WireGuardConfigFilePath+WireGuardConfigFileName)
 	else:
@@ -794,7 +796,7 @@ def GenerateConfig(dict_config):
 		# second best is to use wg-quick if the root user.
 		if RootUser:
 			logger.info('It appears that staticIP is running as the root user and NetworkManager is not installed.')
-			logger.info('Do you want to temporarily bring the tunnel up and assign the dedicated public IP address to this system using wg-quick?')
+			logger.info('Do you want to temporarily bring the tunnel up and assign the dedicated public IP Network to this system using wg-quick?')
 			logger.warning('`staticIP` does not know if you have an active firewall running, so it is your responsibility to make sure there is one.')
 
 			print()
@@ -803,7 +805,7 @@ def GenerateConfig(dict_config):
 			print()
 			print()
 			if UserInput.casefold() == 'y' or UserInput.casefold() == 'yes':
-				logger.info('bringing up ' + dict_config['addresses'][0] + ' using wg-quick')
+				logger.info('bringing up ' + str(dict_config['addresses']) + ' using wg-quick')
 				RunResult=subprocess.run(
 											[
 												'wg-quick',
@@ -812,10 +814,10 @@ def GenerateConfig(dict_config):
 											],
 											check=True,
 										)
-				logger.info('brought up ' + dict_config['addresses'][0] + ' using wg-quick. in order to bring the interface back down, run `wg-quick down '+WireGuardConfigBaseFileName+'`.')
+				logger.info('brought up ' + str(dict_config['addresses']) + ' using wg-quick. in order to bring the interface back down, run `wg-quick down '+WireGuardConfigBaseFileName+'`.')
 
 			else:
-				logger.info('NOT bringing up ' + dict_config['addresses'][0] + ' using wg-quick.')
+				logger.info('NOT bringing up ' + str(dict_config['addresses']) + ' using wg-quick.')
 		else:
 			logger.info('NetworkManager not found and staticIP is not running as the root user. You will need to manually bring up the tunnel interface.')
 			logger.info('If you know what you are doing (i.e. have proper filewall active), manually bring up the interface using')
@@ -1400,7 +1402,7 @@ class AutoPay(Thread):
 # could force the server to do the same thing and use the same start_time_CurrentRate as start_time for the first payment.... it probably won't matter and may be simpler as long as they are consistent because they will calculate the same Credit when they do
 # their regular credit checks.
 
-												TunnelStateFile['Address']=ServerStatusAfterPayment['Address']			# need to use the new ServerStatus because now the Address will be populated
+												TunnelStateFile['Networks']=ServerStatusAfterPayment['Networks']			# need to use the new ServerStatus because now the Networks will be populated
 												TunnelStateFile['start_time']=ServerStatus['current_time']				# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer
 											else:
 												TunnelStateFile['Credit_PreviousRate']=Credit(TunnelStateFile,ServerStatus['current_time'])	# since current_time was within tolerance, agree to use the server's time as the time so everything should match up closer

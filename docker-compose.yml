@@ -14,3 +14,6 @@ services:
 #       - SYS_MODULE           # might be needed if wireguard is not used on the host machine to load some kernel modules ????
     sysctls:
        - net.ipv4.conf.all.src_valid_mark=1     # wg-quick wants to do this, but it can't, so do it ahead of time for it.
+       - net.ipv6.conf.all.disable_ipv6=0       # needed to allow wg-quick to bring up a tunnel with IPv6 networks assigned to it.
+
+

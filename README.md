@@ -51,22 +51,24 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 ## Installation Options ##
 
 
-### Normal Local User ###
+### Normal Local User (ubuntu) ###
 
 ```bash
 sudo apt update
 sudo apt install -y python3-pip git libsystemd-dev pkg-config
 sudo apt install -y resolvconf traceroute wireguard-tools          # optional
+sudo ufw enable                                                    # recommended
 pip3 install git+https://github.com/AndySchroder/StaticWire.git
 ```
 
 
-### Python virtualenv ###
+### Python virtualenv (ubuntu) ###
 
 ```bash
 sudo apt update
 sudo apt install -y python3-pip git libsystemd-dev pkg-config
 sudo apt install -y resolvconf traceroute wireguard-tools          # optional
+sudo ufw enable                                                    # recommended
 python3 -m venv venv
 source venv/bin/activate
 pip3 install git+https://github.com/AndySchroder/StaticWire.git

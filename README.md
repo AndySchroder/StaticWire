@@ -104,16 +104,51 @@ to get a shell inside the docker container.
 After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides dedicated public static IP Networks.
 
 ```
-usage: staticIP [-h] [--amount AMOUNT] {AddCredit,GetRentalStatus,GetConf,AutoPay}
+usage: staticIP [-h] [--amount AMOUNT]
+                [--rental_server_host RENTAL_SERVER_HOST]
+                [--rental_server_fingerprint RENTAL_SERVER_FINGERPRINT]
+                {AddCredit,GetRentalStatus,GetConf,AutoPay}
+
+StaticWire: Rent wireguard tunnels with dedicated public static IP
+Networks using bitcoin lightning payments
+
+positional arguments:
+  {AddCredit,GetRentalStatus,GetConf,AutoPay}
+                        Action to take: `AddCredit` provides a lightning
+                        invoice to add credit to an existing tunnel
+                        rental. If there is no existing tunnel rental
+                        then a lightning invoice is provided for a new
+                        tunnel and then the new tunnel rental is started
+                        and a wireguard configuration is provided after
+                        payment is made. `GetRentalStatus` will give the
+                        current status of the tunnel so that you can
+                        check when you need to use `AddCredit` to make
+                        payments. `GetConf` gets the tunnel's wireguard
+                        configuration if you lost it after initially
+                        running `AddCredit`. `AutoPay` runs continuously
+                        and uses stored LND credentials to automatically
+                        pay to maintain the tunnel.
+
+options:
+  -h, --help            show this help message and exit
+  --amount AMOUNT       allows the amount of credit that you want to add
+                        to be specified when using `AddCredit` (default:
+                        24000) [sat].
+  --rental_server_host RENTAL_SERVER_HOST
+                        If defined, overrides the the default rental
+                        server host in the config file. If not defined
+                        and no value present in the config file, an
+                        internal default of 38.45.103.1 is used.
+  --rental_server_fingerprint RENTAL_SERVER_FINGERPRINT
+                        If defined, overrides the the default rental
+                        server trusted fingerprint in the config file. If
+                        not defined and no value present in the config
+                        file, an internal default of 873c306a1f6a6b8f3ae4
+                        39a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d is
+                        used.
 ```
 
-- `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made.
-- `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments.
-- `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`.
-- `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.
-- `--amount AMOUNT` allows the amount of credit that you want to add to be specified when using `AddCredit` (the default is 24,000) [sat].
-  
-  
+
 
 ### General ###
 
@@ -159,7 +194,7 @@ ________________________________________________________________
 
 ## Copyright ##
 
-Copyright (c) 2023, [Andy Schroder](http://AndySchroder.com)
+Copyright (c) 2025, [Andy Schroder](http://AndySchroder.com)
 
 ## License ##
 

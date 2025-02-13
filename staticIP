@@ -47,6 +47,35 @@ yaml.indent(mapping=8, sequence=2, offset=0)
 
 
 
+################################################################
+# define constants
+################################################################
+
+NumberChecksBetweenExpectedPayments=11
+OneDay=3600*24
+
+
+
+
+
+
+
+
+################################################################
+# assign defaults
+################################################################
+
+DefaultHost='38.45.103.1'
+DefaultTrustedFingerprint='873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
+
+ConfigFileName='Config.yaml'
+TunnelStateFileName='TunnelState.yaml'
+
+
+
+
+
+
 
 ################################################################
 # Only Allow One Instance to run at a time
@@ -112,6 +141,8 @@ CatchKill()
 parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP Networks using bitcoin lightning payments")
 parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.")
 parser.add_argument('--amount', default=24000,type=int,help="allows the amount of credit that you want to add to be specified when using `AddCredit` (default: %(default)s) [sat].")
+parser.add_argument('--rental_server_host', default=None,type=str,help="If defined, overrides the the default rental server host in the config file. If not defined and no value present in the config file, an internal default of "+DefaultHost+" is used.")
+parser.add_argument('--rental_server_fingerprint', default=None,type=str,help="If defined, overrides the the default rental server trusted fingerprint in the config file. If not defined and no value present in the config file, an internal default of "+DefaultTrustedFingerprint+" is used.")
 arguments=parser.parse_args()
 
 
@@ -281,35 +312,6 @@ if MadeNewDataFolder:
 
 
 
-
-
-
-################################################################
-# define constants
-################################################################
-
-NumberChecksBetweenExpectedPayments=11
-OneDay=3600*24
-
-
-
-
-
-
-
-
-################################################################
-# assign defaults
-################################################################
-
-DefaultHostName='https://38.45.103.1'
-DefaultTrustedFingerprint='873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
-
-ConfigFileName='Config.yaml'
-TunnelStateFileName='TunnelState.yaml'
-
-
-
 ################################################################
 # read ConfigFile from home folder and apply defaults for missing values
 ################################################################
@@ -331,37 +333,75 @@ else:
 
 
 
-if ConfigFile.get('Server') is None or ConfigFile['Server'].get('HostName') is None:
-	if (ConfigFile.get('Server') is not None) and (ConfigFile['Server'].get('TrustedFingerprint') is not None):
-		raise Exception('HostName not defined but TrustedFingerprint defined defined in '+TheDataFolder+ConfigFileName)
-	else:
-		ConfigFile['Server'] =	{
-						'HostName' :		DefaultHostName,
-						'TrustedFingerprint' :	DefaultTrustedFingerprint,
-					}
 
-		ChangesToConfigFile=True
-		logger.info('HostName and TrustedFingerprint not defined, assigning default values of '+DefaultHostName+' and '+DefaultTrustedFingerprint)
-
-elif ConfigFile['Server'].get('TrustedFingerprint') is None:
-	raise Exception('HostName defined but TrustedFingerprint not defined in '+TheDataFolder+ConfigFileName)
+# rental server host and trusted fingerprint definition take the following priority
+# 1. config file: per tunnel host and trusted fingerprint (TODO / NOT YET IMPLEMENTED!)
+# 2. command line parameters (TODO: MUST RAISE ERROR IF (1) IS ATTEMPTED AT THE SAME TIME ?)
+# 3. config file: default host and trusted fingerprint
+# 4. hardcoded defaults defined above
 
 
-if ConfigFile.get('private_key') is None:
+RentalServerDefaultConfig={}
+
+if arguments.rental_server_host is not None:
+	RentalServerDefaultConfig['Host']=arguments.rental_server_host
+	logger.info("using "+arguments.rental_server_host+" from the command line for the rental server default host")
+
+elif ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('Host') is not None:
+	RentalServerDefaultConfig['Host']=ConfigFile['DefaultRentalServer']['Host']
+	logger.info("using "+ConfigFile['DefaultRentalServer']['Host']+" from the config file for the rental server default host")
+else:
+	RentalServerDefaultConfig['Host']=DefaultHost
+	logger.info("using "+DefaultHost+" for the rental server default host")
+
+
+if arguments.rental_server_fingerprint is not None:
+	RentalServerDefaultConfig['TrustedFingerprint']=arguments.rental_server_fingerprint
+	logger.info("using "+arguments.rental_server_fingerprint+" from the command line for the rental server default trusted fingerprint")
+
+elif ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('TrustedFingerprint') is not None:
+	RentalServerDefaultConfig['TrustedFingerprint']=ConfigFile['DefaultRentalServer']['TrustedFingerprint']
+	logger.info("using "+ConfigFile['DefaultRentalServer']['TrustedFingerprint']+" from the config file for the rental server default trusted fingerprint")
+else:
+	RentalServerDefaultConfig['TrustedFingerprint']=DefaultTrustedFingerprint
+	logger.info("using "+DefaultTrustedFingerprint+" for the rental server default trusted fingerprint")
+
+
+
+
+# TODO: don't require the client to have a wireguard private key, but don't allow creating wireguard configs if missing, only allow paying.
+# TODO: allow multiple tunnels to be defined
+
+if ConfigFile.get('tunnels') is None:
+
+	ConfigFile['tunnels']=[]
+	Tunnel={}
 
 	#from secrets import base64,token_bytes
-	#ConfigFile['public_key']=base64.b64encode(token_bytes()).decode()
+	#Tunnel['wireguard_public_key']=base64.b64encode(token_bytes()).decode()
 
 	# generate a new private key and save it.
 
 	private_key = WireguardKey.generate()
-	ConfigFile['private_key'] = str(private_key)
-	ConfigFile['public_key'] = str(private_key.public_key())
+	Tunnel['wireguard_private_key'] = str(private_key)
+	Tunnel['wireguard_public_key'] = str(private_key.public_key())
+
+	ConfigFile['tunnels']+=[Tunnel]
 
 	ChangesToConfigFile=True
-	logger.info('no private_key found in '+TheDataFolder+ConfigFileName+', so created one and overwrote any public_key that may have existed with a new one!')
+	logger.info('no wireguard_private_key found in '+TheDataFolder+ConfigFileName+', so created one and overwrote any wireguard_public_key that may have existed with a new one!')
 
-logger.info('local wireguard public_key: '+ConfigFile['public_key'])
+else:
+	try:
+		Tunnel=ConfigFile['tunnels'][0]
+		if Tunnel.get('wireguard_public_key') is None or Tunnel.get('wireguard_private_key') is None:
+			raise Exception
+	except:
+		raise Exception('tunnel not configured properly in config file')
+
+
+logger.info('local wireguard public_key: '+Tunnel['wireguard_public_key'])
+
 
 if ChangesToConfigFile:
 	logger.debug('writing to '+TheDataFolder+ConfigFileName)
@@ -384,7 +424,7 @@ else:
 # requiring a trusted fingerprint allows verify=False to be used on each request. note, https://medium.com/@jbirdvegas/python-certificate-pinning-c44e9a34ed1c suggests that
 # requests_toolbelt ignores the fingerprint verification of standard validation is turned off, but tested it and this seems to not be true.
 SecureSession = requests.Session()
-SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFile['Server']['TrustedFingerprint']))		#ConfigFile['Server']['HostName'] is needed here (in addition to in the .post() function) to provide a scope for the FingerprintAdapter.
+SecureSession.mount('https://'+RentalServerDefaultConfig['Host'],FingerprintAdapter(RentalServerDefaultConfig['TrustedFingerprint']))		#RentalServerDefaultConfig['Host'] is needed here (in addition to in the .post() function) to provide a scope for the FingerprintAdapter.
 
 
 
@@ -403,7 +443,7 @@ SecureSession.mount(ConfigFile['Server']['HostName'],FingerprintAdapter(ConfigFi
 
 def AddCredit(amount):
 
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/AddCredit/', data={'WireGuardPubKey': ConfigFile['public_key'], 'amount': amount},verify=False)
+	response = SecureSession.post('https://'+RentalServerDefaultConfig['Host']+'/api/AddCredit/', data={'WireGuardPubKey': Tunnel['wireguard_public_key'], 'amount': amount},verify=False)
 
 	if response.status_code != 200:
 
@@ -434,7 +474,7 @@ def AddCredit(amount):
 			print()
 			print('---------------------------------------------------------------------------------------------------')
 			print()
-			logger.info('no existing rental found associated with the wireguard public key '+ConfigFile['public_key']+'. renting a new tunnel with an initial credit amount of '+RoundAndPadToString(amount,0)+' [sat]')
+			logger.info('no existing rental found associated with the wireguard public key '+Tunnel['wireguard_public_key']+'. renting a new tunnel with an initial credit amount of '+RoundAndPadToString(amount,0)+' [sat]')
 			print()
 
 			NewRemainingTime=AddedTime
@@ -501,7 +541,7 @@ def AddCredit(amount):
 
 
 def RentalStatus(InvoiceToWaitFor=None):
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getstatus/', data={'WireGuardPubKey': ConfigFile['public_key'], 'InvoiceToWaitFor': InvoiceToWaitFor},verify=False)
+	response = SecureSession.post('https://'+RentalServerDefaultConfig['Host']+'/api/getstatus/', data={'WireGuardPubKey': Tunnel['wireguard_public_key'], 'InvoiceToWaitFor': InvoiceToWaitFor},verify=False)
 
 	if (response.status_code != 200) or ('Error' in response.json()):
 
@@ -604,7 +644,7 @@ def CompactRentalStatus(Status,LNDBalance=None):
 
 
 def GetConf():
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/getconf/', data={'WireGuardPubKey': ConfigFile['public_key']},verify=False)
+	response = SecureSession.post('https://'+RentalServerDefaultConfig['Host']+'/api/getconf/', data={'WireGuardPubKey': Tunnel['wireguard_public_key']},verify=False)
 
 	if response.status_code != 200:
 
@@ -676,7 +716,7 @@ def CheckServiceState(ServiceName,SubStateValue='running'):
 
 def GenerateConfig(dict_config):
 
-	dict_config['private_key']=ConfigFile['private_key']
+	dict_config['private_key']=Tunnel['wireguard_private_key']
 
 	config = WireguardConfig.from_dict(dict_config)
 
@@ -701,7 +741,7 @@ def GenerateConfig(dict_config):
 
 	# use 'sw_' + 'first 12 characters of the wireguard public key' for the filename, because wg-quick uses the filename as the interface name and linux interface names can only be 15 characters long.
 	# also, convert the public key from base64 to urlsafe base64 so that a valid name can be ensured
-	WireGuardConfigBaseFileName='sw_'+urlsafe_b64encode(b64decode(ConfigFile['public_key'])).decode()[:12]
+	WireGuardConfigBaseFileName='sw_'+urlsafe_b64encode(b64decode(Tunnel['wireguard_public_key'])).decode()[:12]
 	# then add the extension.
 	WireGuardConfigFileName=WireGuardConfigBaseFileName+'.conf'
 
@@ -858,7 +898,7 @@ def GetSellOfferTerms():
 	# TODO: retry on network connection failure.
 	# TODO: add a command line option so that it can be manually run if desired and not just with AutoPay.
 
-	response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/GetSellOfferTerms/', verify=False)
+	response = SecureSession.post('https://'+RentalServerDefaultConfig['Host']+'/api/GetSellOfferTerms/', verify=False)
 
 	if (response.status_code != 200) or ('Error' in response.json()):
 
@@ -1310,7 +1350,7 @@ class AutoPay(Thread):
 									logger.debug('requesting the invoice')
 									# TODO: retry on network connection failure.
 									# TODO: separate this out into a separate function and combine with the AddCredit function
-									response = SecureSession.post(ConfigFile['Server']['HostName']+'/api/AddCredit/', data={'WireGuardPubKey': ConfigFile['public_key'], 'amount': ProposedPaymentSize},verify=False)
+									response = SecureSession.post('https://'+RentalServerDefaultConfig['Host']+'/api/AddCredit/', data={'WireGuardPubKey': Tunnel['wireguard_public_key'], 'amount': ProposedPaymentSize},verify=False)
 									logger.debug('done requesting the invoice')
 
 									if response.status_code != 200:

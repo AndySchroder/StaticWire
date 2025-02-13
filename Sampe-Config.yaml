@@ -1,0 +1,11 @@
+
+DefaultRentalServer:
+                Host:                 '38.45.103.1'
+                TrustedFingerprint:   '873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
+
+
+tunnels:
+        # use an array so that the client can be later expanded to support managing multiple tunnels
+        -
+          wireguard_private_key: CNlafsFx3lgESI61mjBfVgdsmz+QLlUnQTvOauBeO0w=
+          wireguard_public_key:  Et+NuvYiVmJNgPDT1QTT0FmTXywBpYOgT1Rsuyt2Mmg=

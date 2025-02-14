@@ -3,7 +3,7 @@
 
 ###############################################################################
 ###############################################################################
-# Copyright (c) 2023, Andy Schroder
+# Copyright (c) 2025, Andy Schroder
 # See the file README.md for licensing information.
 ###############################################################################
 ###############################################################################
@@ -20,7 +20,7 @@ from pathlib import Path
 import sys,socket,subprocess
 from os import makedirs,getcwd,symlink,geteuid
 from os.path import isfile,isdir
-from argparse import ArgumentParser
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from ruamel.yaml import YAML
 from time import time,sleep
 from lndgrpc import LNDClient
@@ -34,6 +34,7 @@ from helpers2 import RoundAndPadToString,IndentedPrettyPrint,SetPrintWarningMess
 from threading import Thread,Event
 from pystemd.systemd1 import Unit
 from base64 import b64decode,urlsafe_b64encode
+from textwrap import fill, indent
 
 # use ruamel.yaml to try and get more desireable indentation of the output
 # ruamel.yaml claims it is so much better than PyYAML, but it is not really that much better.
@@ -56,24 +57,16 @@ OneDay=3600*24
 
 
 
-
-
-
-
-
 ################################################################
 # assign defaults
 ################################################################
 
 DefaultHost='38.45.103.1'
 DefaultTrustedFingerprint='873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
+DefaultAmount=6000
 
 ConfigFileName='Config.yaml'
 TunnelStateFileName='TunnelState.yaml'
-
-
-
-
 
 
 
@@ -100,8 +93,6 @@ OnlyAllowOneInstance('staticIP')
 
 
 
-
-
 ################################################################
 # cleanly catch shutdown signals
 ################################################################
@@ -121,37 +112,6 @@ CatchKill()
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-################################################################
-# parse the command line
-################################################################
-
-parser = ArgumentParser(description="StaticWire: Rent wireguard tunnels with dedicated public static IP Networks using bitcoin lightning payments")
-parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.")
-parser.add_argument('--amount', default=24000,type=int,help="allows the amount of credit that you want to add to be specified when using `AddCredit` (default: %(default)s) [sat].")
-parser.add_argument('--rental_server_host', default=None,type=str,help="If defined, overrides the the default rental server host in the config file. If not defined and no value present in the config file, an internal default of "+DefaultHost+" is used.")
-parser.add_argument('--rental_server_fingerprint', default=None,type=str,help="If defined, overrides the the default rental server trusted fingerprint in the config file. If not defined and no value present in the config file, an internal default of "+DefaultTrustedFingerprint+" is used.")
-arguments=parser.parse_args()
-
-
-
-
-
-
-
-
 ################################################################
 # give some extra space in the output terminal
 ################################################################
@@ -163,11 +123,9 @@ print('')
 
 
 
-
 ################################################################
 # make the data directory if it doesn't exist.
 ################################################################
-
 
 TheDataFolder=str(Path.home())+'/.StaticWire/'
 
@@ -176,7 +134,6 @@ if not isdir(TheDataFolder):
 	MadeNewDataFolder=True
 else:
 	MadeNewDataFolder=False
-
 
 
 
@@ -228,13 +185,10 @@ class PreciseTimeFormatterWithColorizedLevel(logging.Formatter):
 		return super(PreciseTimeFormatterWithColorizedLevel, self).format(record, *args, **kwargs)
 
 
-
-
 console_log_level="info"
 logfile_log_level="debug"
 
 FormatStringTemplate='%(TIMEDATECOLOR)s%(asctime)s%(color_off)s [%(color_on)s%(levelname)8s%(color_off)s, %(FUNCTIONNAMECOLOR)s%(funcName)8.8s%(color_off)s]:   %(message)s'
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -244,18 +198,12 @@ console.setLevel(console_log_level.upper())
 ColorizeConsole=sys.stdout.isatty()				# if directed to a tty colorize, otherwise don't (so won't get escape sequences in systemd logs for example)
 console.setFormatter(PreciseTimeFormatterWithColorizedLevel(fmt=FormatStringTemplate, color=ColorizeConsole))
 
-
 logfile = logging.FileHandler(TheDataFolder+"debug.log")
 logfile.setLevel(logfile_log_level.upper()) # only accepts uppercase level names
 logfile.setFormatter(PreciseTimeFormatterWithColorizedLevel(fmt=FormatStringTemplate, color=False))
 
 logger.addHandler(console)
 logger.addHandler(logfile)
-
-
-
-
-
 
 
 logger.info('--------------------- startup ! ---------------------')
@@ -265,60 +213,9 @@ if MadeNewDataFolder:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ################################################################
-# read ConfigFile from home folder and apply defaults for missing values
+# read ConfigFile from home folder
 ################################################################
-
-
-ChangesToConfigFile=False
-
 
 if isfile(TheDataFolder+ConfigFileName):
 	with open(TheDataFolder+ConfigFileName, 'r') as file:
@@ -333,41 +230,64 @@ else:
 
 
 
+################################################################
+# use default values in the config file if they are defined
+################################################################
 
-# rental server host and trusted fingerprint definition take the following priority
-# 1. config file: per tunnel host and trusted fingerprint (TODO / NOT YET IMPLEMENTED!)
+# parameter definitions take the following priority
+# 1. config file: per tunnel (TODO / NOT YET IMPLEMENTED!)
 # 2. command line parameters (TODO: MUST RAISE ERROR IF (1) IS ATTEMPTED AT THE SAME TIME ?)
-# 3. config file: default host and trusted fingerprint
+# 3. config file: defaults
 # 4. hardcoded defaults defined above
 
+if ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('Host') is not None:
+	DefaultHost=ConfigFile['DefaultRentalServer']['Host']
+	logger.info("using "+DefaultHost+" from the config file for the default rental server default host")
+
+if ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('TrustedFingerprint') is not None:
+	DefaultTrustedFingerprint=ConfigFile['DefaultRentalServer']['TrustedFingerprint']
+	logger.info("using "+DefaultTrustedFingerprint+" from the config file for the default rental server default trusted fingerprint")
+
+if ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('Amount') is not None:
+	DefaultAmount=ConfigFile['DefaultRentalServer']['Amount']
+	logger.info("using "+str(DefaultAmount)+" from the config file for the default amount of credit to add")
+
+
+
+################################################################
+# parse the command line
+################################################################
+
+parser = ArgumentParser(description="StaticWire:\n \n"+indent(fill("Rent Dedicated Public Static Internet Protocol Subnets Using Bitcoin's Lightning Network And Wireguard",width=67),'   '), epilog=indent(fill("Default named argument values can be set in `"+TheDataFolder+ConfigFileName+'`, if not, an internal default is used. See `Sample-Config.yaml` for examples.',width=67), '   '),formatter_class=RawDescriptionHelpFormatter)		# note the difference between RawDescriptionHelpFormatter and RawTextHelpFormatter
+parser.add_argument("Action",choices=['AddCredit','GetRentalStatus','GetConf','AutoPay'], help="Action to take: `AddCredit` provides a lightning invoice to add credit to an existing tunnel rental. If there is no existing tunnel rental then a lightning invoice is provided for a new tunnel and then the new tunnel rental is started and a wireguard configuration is provided after payment is made. `GetRentalStatus` will give the current status of the tunnel so that you can check when you need to use `AddCredit` to make payments. `GetConf` gets the tunnel's wireguard configuration if you lost it after initially running `AddCredit`. `AutoPay` runs continuously and uses stored LND credentials to automatically pay to maintain the tunnel.")
+parser.add_argument('--rental_server_host', default=DefaultHost,type=str,help="The default rental server host (default: %(default)s).")
+parser.add_argument('--rental_server_fingerprint', default=DefaultTrustedFingerprint,type=str,help="The default rental server trusted fingerprint (default: %(default)s).")
+parser.add_argument('--amount', default=DefaultAmount,type=int,help="The amount of credit that you want to add when using `AddCredit` (default: %(default)s) [sat]. If this is a new tunnel, an activation fee will be added to this credit amount in the invoiced amount.")
+arguments=parser.parse_args()
+
+
+
+################################################################
+# use values from the command line (or the defaults if they were not defined)
+################################################################
 
 RentalServerDefaultConfig={}
+RentalServerDefaultConfig['Host']=arguments.rental_server_host
+RentalServerDefaultConfig['TrustedFingerprint']=arguments.rental_server_fingerprint
+RentalServerDefaultConfig['Amount']=arguments.amount
 
-if arguments.rental_server_host is not None:
-	RentalServerDefaultConfig['Host']=arguments.rental_server_host
-	logger.info("using "+arguments.rental_server_host+" from the command line for the rental server default host")
-
-elif ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('Host') is not None:
-	RentalServerDefaultConfig['Host']=ConfigFile['DefaultRentalServer']['Host']
-	logger.info("using "+ConfigFile['DefaultRentalServer']['Host']+" from the config file for the rental server default host")
-else:
-	RentalServerDefaultConfig['Host']=DefaultHost
-	logger.info("using "+DefaultHost+" for the rental server default host")
-
-
-if arguments.rental_server_fingerprint is not None:
-	RentalServerDefaultConfig['TrustedFingerprint']=arguments.rental_server_fingerprint
-	logger.info("using "+arguments.rental_server_fingerprint+" from the command line for the rental server default trusted fingerprint")
-
-elif ConfigFile.get('DefaultRentalServer') is not None and ConfigFile['DefaultRentalServer'].get('TrustedFingerprint') is not None:
-	RentalServerDefaultConfig['TrustedFingerprint']=ConfigFile['DefaultRentalServer']['TrustedFingerprint']
-	logger.info("using "+ConfigFile['DefaultRentalServer']['TrustedFingerprint']+" from the config file for the rental server default trusted fingerprint")
-else:
-	RentalServerDefaultConfig['TrustedFingerprint']=DefaultTrustedFingerprint
-	logger.info("using "+DefaultTrustedFingerprint+" for the rental server default trusted fingerprint")
+logger.info("using "+RentalServerDefaultConfig['Host']+" for the rental server default host")
+logger.info("using "+RentalServerDefaultConfig['TrustedFingerprint']+" for the rental server default trusted fingerprint")
+logger.info("using "+str(RentalServerDefaultConfig['Amount'])+" for the amount of credit to add")
 
 
 
+################################################################
+# fetch wireguard key pair from config or generate a new one and save to config
+################################################################
+
+
+ChangesToConfigFile=False
 
 # TODO: don't require the client to have a wireguard private key, but don't allow creating wireguard configs if missing, only allow paying.
 # TODO: allow multiple tunnels to be defined
@@ -1570,7 +1490,7 @@ class AutoPay(Thread):
 ################################################################
 
 if   arguments.Action == 'AddCredit':
-	AddCredit(amount=arguments.amount)
+	AddCredit(amount=RentalServerDefaultConfig['Amount'])
 elif arguments.Action == 'GetRentalStatus':
 	PrintRentalStatus(RentalStatus())
 elif arguments.Action == 'GetConf':

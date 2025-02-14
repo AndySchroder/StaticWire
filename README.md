@@ -36,10 +36,10 @@ The command line tool `staticIP` generates a private/public key pair for the tun
 ### Current Terms of Sale (subject to change) ###
 
 - The first payment includes 
-    - a non-refundable activation fee of 48,000 sat that reserves the tunnel & the dedicated public static IPv4 address and
+    - a non-refundable activation fee of 12,000 sat that reserves the tunnel & the dedicated public static IPv4 address and
     - at least 1,000 sat for the initial rental credit (this may be increased in the future to prevent IP address squatting if there is too much abuse of the server).
-- The total minimum first payment therefor is 49,000 sat.
-- After the first payment the smallest allowable rental credit payment size is 500 sat. The default payment size is 24,000 sat (1 month's rent). Server max credit will be 72,000 sat (3 month's rent) for now but the plan is to increase to 288,000 sat (12 month's rent) in the medium term and 576,000 sat (24 month's rent) in the long term.
+- The total minimum first payment therefor is 13,000 sat.
+- After the first payment the smallest allowable rental credit payment size is 500 sat. The default payment size is 6,000 sat (1 month's rent). Server max credit will be 18,000 sat (3 month's rent) for now but the plan is to increase to 72,000 sat (12 month's rent) in the medium term and 144,000 sat (24 month's rent) in the long term.
 - If no payments are made and the rental credit becomes 0, the tunnel will be turned off but the address will be reserved for up to 2 months. In order to re-activate the tunnel, back rental payments are required.
 - This service is experimental, and being shared for trial use. It comes with no warranty or liabilities of any kind.
 - This service provides a raw internet connection with no firewall built in. It is the user's responsibility to apply appropriate firewalling. Not liable for damages of any kind do to lack of expertise in how tunnels and routers works.
@@ -104,13 +104,15 @@ to get a shell inside the docker container.
 After following one of the above installation approaches, you can use the `staticIP` command to manage a tunnel rental that provides dedicated public static IP Networks.
 
 ```
-usage: staticIP [-h] [--amount AMOUNT]
-                [--rental_server_host RENTAL_SERVER_HOST]
+usage: staticIP [-h] [--rental_server_host RENTAL_SERVER_HOST]
                 [--rental_server_fingerprint RENTAL_SERVER_FINGERPRINT]
+                [--amount AMOUNT]
                 {AddCredit,GetRentalStatus,GetConf,AutoPay}
 
-StaticWire: Rent wireguard tunnels with dedicated public static IP
-Networks using bitcoin lightning payments
+StaticWire:
+ 
+   Rent Dedicated Public Static Internet Protocol Subnets Using
+   Bitcoin's Lightning Network And Wireguard
 
 positional arguments:
   {AddCredit,GetRentalStatus,GetConf,AutoPay}
@@ -131,21 +133,21 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --amount AMOUNT       allows the amount of credit that you want to add
-                        to be specified when using `AddCredit` (default:
-                        24000) [sat].
   --rental_server_host RENTAL_SERVER_HOST
-                        If defined, overrides the the default rental
-                        server host in the config file. If not defined
-                        and no value present in the config file, an
-                        internal default of 38.45.103.1 is used.
+                        The default rental server host (default:
+                        38.45.103.1).
   --rental_server_fingerprint RENTAL_SERVER_FINGERPRINT
-                        If defined, overrides the the default rental
-                        server trusted fingerprint in the config file. If
-                        not defined and no value present in the config
-                        file, an internal default of 873c306a1f6a6b8f3ae4
-                        39a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d is
-                        used.
+                        The default rental server trusted fingerprint
+                        (default: 873c306a1f6a6b8f3ae439a5fbd55025edd7bb8
+                        724390f4a21bfe5c35f568b2d).
+  --amount AMOUNT       The amount of credit that you want to add when
+                        using `AddCredit` (default: 6000) [sat]. If this
+                        is a new tunnel, an activation fee will be added
+                        to this credit amount in the invoiced amount.
+
+   Default named argument values can be set in
+   `/root/.StaticWire/Config.yaml`, if not, an internal default is
+   used. See `Sample-Config.yaml` for examples.
 ```
 
 

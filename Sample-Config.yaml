@@ -1,7 +1,10 @@
 
+# define rental server defaults. in the future, we will have the option to
+# specify specific values on a per-tunnel basis.
 DefaultRentalServer:
                 Host:                 '38.45.103.1'
                 TrustedFingerprint:   '873c306a1f6a6b8f3ae439a5fbd55025edd7bb8724390f4a21bfe5c35f568b2d'
+                Amount:               6000        # amount of credit (in sat) to add if not specified on the command line.
 
 
 tunnels:
